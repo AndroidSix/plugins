@@ -3,7 +3,7 @@
 // zcode_start_test.go TestZCodeStartPlanOwnAccount, zcode_team_test.go).
 import { test, expect, afterAll, beforeAll, beforeEach } from "bun:test"
 import { homedir, tmpdir } from "node:os"
-import { realpathSync } from "node:fs"
+import { readFileSync, realpathSync } from "node:fs"
 
 let ZCodeAuthPlugin, _internal
 beforeAll(async () => {
@@ -41,6 +41,11 @@ async function usage(auth, sets = []) {
   return hooks.auth.usage(async () => auth, { id: "zcode" })
 }
 const jwt = (exp) => ["{}", JSON.stringify({ exp })].map((s) => Buffer.from(s).toString("base64url")).join(".") + ".sig"
+// a card read with no ZCode session says the gift plans need one: a key
+// (or a sign-in with no ZCode token) reads no gift and lists no -Trial
+const GIFT = "ZCode gift plans (-Trial models) need ZCode's sign-in"
+const KEY_LINE = { name: GIFT, used: 0, aside: true, display: "not read with an API key: add the account with a ZCode sign-in" }
+const NO_SESSION = { name: GIFT, used: 0, aside: true, display: "this sign-in has no ZCode session: sign in again" }
 
 test("a Coding Plan's five hours and week", async () => {
   const reset = Date.now() + 3600_000
@@ -59,13 +64,36 @@ test("a Coding Plan's five hours and week", async () => {
     windows: [
       { name: "5 hours", used: 25, display: "500 / 2000", amount: 500, limit: 2000, resetsAt: new Date(reset).toISOString(), span: 5 * 3600 },
       { name: "Weekly", used: 10, display: "1000 / 10000", amount: 1000, limit: 10000, resetsAt: new Date(reset).toISOString(), span: 7 * 86400 },
+      NO_SESSION,
     ],
   })
   expect(calls.every((c) => c.url.origin === "https://api.z.ai")).toBe(true)
   // an API key, BigModel's, is asked on its own site
-  const bm = serve(({ url }) => (url.pathname.endsWith("/limit") ? ok({ limits: [] }) : ok([])))
-  expect(await usage({ type: "api", key: "k", metadata: { site: "bigmodel" } })).toEqual({ signIn: "kept", windows: [] })
+  const bm = serve(({ url }) => (url.pathname.endsWith("/limit") ? ok({ level: "lite", limits: [] }) : ok([{ productName: "GLM Coding Lite", status: "VALID" }])))
+  expect(await usage({ type: "api", key: "k", metadata: { site: "bigmodel" } })).toEqual({ signIn: "kept", plan: "GLM Coding Lite", windows: [KEY_LINE] })
   expect(bm[0].url.origin).toBe("https://open.bigmodel.cn")
+})
+
+// rtbeilin (X, 10-24): ZCode 1024 Dev Day, no GLM Coding Plan, "API Key
+// doesn't work". The gift is ZCode's session's alone; a key's card says
+// so instead of showing nothing
+test("a key with no GLM Coding Plan says a ZCode gift plan needs ZCode's sign-in", async () => {
+  const none = /no GLM Coding Plan; ZCode's gift plans .* are spent only with ZCode's sign-in, never with a key/
+  for (const site of ["zai", "bigmodel"]) {
+    serve(({ url }) => (url.pathname.endsWith("/limit") ? ok({ limits: [] }) : ok([])))
+    expect((await usage({ type: "api", key: "k", metadata: { site } })).error).toMatch(none)
+    // a subscription that ran out is no plan in force either
+    serve(({ url }) => (url.pathname.endsWith("/limit") ? ok({ limits: [] }) : ok([{ productName: "GLM Coding Lite", status: "EXPIRED" }])))
+    expect((await usage({ type: "api", key: "k", metadata: { site } })).error).toMatch(none)
+  }
+  // a list that couldn't be read is not "no plan"
+  serve(({ url }) => (url.pathname.endsWith("/limit") ? ok({ limits: [] }) : new Response("", { status: 500 })))
+  expect(await usage({ type: "api", key: "k", metadata: { site: "zai" } })).toEqual({ signIn: "kept", windows: [KEY_LINE] })
+  // a counted window or a level is a plan, whatever the list says
+  serve(({ url }) => (url.pathname.endsWith("/limit") ? ok({ limits: [{ unit: 3, number: 5, percentage: 3 }] }) : ok([])))
+  expect((await usage({ type: "api", key: "k", metadata: { site: "zai" } })).error).toBeUndefined()
+  serve(({ url }) => (url.pathname.endsWith("/limit") ? ok({ level: "pro", limits: [] }) : ok([])))
+  expect((await usage({ type: "api", key: "k", metadata: { site: "zai" } })).error).toBeUndefined()
 })
 
 test("windows, names and terms as Go reads them", () => {
@@ -212,7 +240,7 @@ test("a Coding Plan of a person's own shows its resets, each with its end, as th
   expect(await usage(auth)).toEqual({
     signIn: "kept",
     plan: "GLM Coding Pro",
-    windows: [],
+    windows: [NO_SESSION],
     resets: { count: 2, byWindow: true, fiveHour: 1, weekly: 1, until: "2026-10-30T15:59:59.000Z", each: [
       { until: "2026-10-30T15:59:59.000Z", window: "weekly" },
       { until: "2026-11-02T15:59:59.000Z", window: "fiveHour" },
@@ -280,6 +308,7 @@ test("a team seat: the team plan's windows, name, end and resets, its key found 
     windows: [
       { name: "5 hours", used: 42, display: "420 / 1000", amount: 420, limit: 1000, resetsAt: new Date(reset).toISOString(), span: 5 * 3600 },
       { name: "Weekly", used: 10, display: "1000 / 10000", amount: 1000, limit: 10000, resetsAt: new Date(reset + 86400000).toISOString(), span: 7 * 86400 },
+      { name: "ZCode gift plans (-Trial models) need ZCode's sign-in", used: 0, aside: true, display: "this sign-in has no ZCode session: sign in again" },
     ],
   })
   expect(made).toEqual({ name: "zcode-team-api-key", keyType: 2 })
@@ -332,7 +361,7 @@ test("a model ZCode's config gives no limits has none made up", () => {
 // hold is named on the card, to be claimed in the ZCode app (the claim needs
 // the app's captcha attestation, see claimHint). Both fixtures are real
 // responses: one account's preview while the day's ZCode Trust Build was
-// still unclaimed, and one after it had claimed it. The plugin never asks
+// still unclaimed, and one after it had claimed it. Reading the card never asks
 // the claim endpoint. The window's name is the fixed sentence magpie
 // translates; the count and the plan's own name are the display.
 const PREVIEW_CLAIMABLE = {
@@ -376,6 +405,22 @@ test("a gift plan ZCode holds but has not granted is named on the card, to claim
   expect(p.headers.Authorization).toBe("Bearer " + token)
   expect(p.headers["X-Device-Mid"]).toBe("11111111-2222-4333-8444-555555555555")
   // nothing claims it here
+  expect(calls.some((c) => c.url.pathname.endsWith("/claim"))).toBe(false)
+})
+
+// #503, 10-30: a banner plan is in the app's marketing feed and in no
+// preview; the card names it too, and still claims nothing
+test("a banner plan from the app's marketing feed is named on the card", async () => {
+  const now = Math.trunc(Date.now() / 1000)
+  const token = jwt(now + 86400)
+  const calls = serve(({ url }) => {
+    if (url.pathname === "/api/v1/zcode-plan/billing/balance") return ok(startBalance(now, "active"))
+    if (url.pathname === "/api/v1/zcode-plan/billing/preview") return ok(PREVIEW_CLAIMED)
+    if (url.pathname === "/api/v1/marketing/touch")
+      return ok({ deliveries: [{ banner: { background: { args: { zcode_plan: { name: "ZCODE WEEKEND BUILD" } } }, buttons: [{ action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan-1030-wk" } } }] } }] })
+  })
+  const u = await usage(oauth({ site: "zai", jwt: token, device: "11111111-2222-4333-8444-555555555555" }))
+  expect(u.windows.at(-1)).toEqual({ name: "Gift plans to claim in the ZCode app", used: 0, aside: true, display: "1 · ZCODE WEEKEND BUILD" })
   expect(calls.some((c) => c.url.pathname.endsWith("/claim"))).toBe(false)
 })
 
@@ -438,7 +483,23 @@ test("a coding account's line goes after its coding and gift windows", async () 
   const auth = oauth({ site: "zai", key: "k", jwt: token, device: "d" })
   const u = await usage(auth)
   expect(u.plan).toBe("GLM Coding Pro")
-  expect(u.windows.map((w) => w.name)).toEqual(["5 hours", "GLM-5.1-Trial", "Gift plans to claim in the ZCode app"])
+  expect(u.windows.map((w) => w.name)).toEqual(["5 hours", "GLM-5.1-Trial · Start Plan", "Gift plans to claim in the ZCode app"])
   expect(u.windows.at(-1)).toEqual(TRUST_BUILD)
   expect(calls.filter((c) => c.url.pathname.endsWith("/preview"))).toHaveLength(1)
+})
+
+// #503: the same card line from the real marketing/touch reply
+// (testdata/touch-1030-wk.json; see checkin.test.mjs for how it was cut)
+test("the real banner feed names its plan once on the card", async () => {
+  const now = Math.trunc(Date.now() / 1000)
+  const token = jwt(now + 86400)
+  const real = readFileSync(new URL("./testdata/touch-1030-wk.json", import.meta.url), "utf8")
+  const calls = serve(({ url }) => {
+    if (url.pathname === "/api/v1/zcode-plan/billing/balance") return ok(startBalance(now, "active"))
+    if (url.pathname === "/api/v1/zcode-plan/billing/preview") return ok(PREVIEW_CLAIMED)
+    if (url.pathname === "/api/v1/marketing/touch") return new Response(real)
+  })
+  const u = await usage(oauth({ site: "zai", jwt: token, device: "11111111-2222-4333-8444-555555555555" }))
+  expect(u.windows.at(-1)).toEqual({ name: "Gift plans to claim in the ZCode app", used: 0, aside: true, display: "1 · ZCODE WEEKEND BUILD" })
+  expect(calls.some((c) => c.url.pathname.endsWith("/claim"))).toBe(false)
 })

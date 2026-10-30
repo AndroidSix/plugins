@@ -219,7 +219,8 @@ const EXPIRED_CLI = EXPIRED + " with `kiro-cli login` or the Kiro IDE"
 
 // gone is an error saying the sign-in itself is gone — refused, or never
 // there. The built-in marked no Kiro account lapsed, not even then, nor
-// cleared one: every answer and usage read says the account is kept.
+// cleared one: every answer says the account is kept. The usage read says
+// expired for it, and renewed for a clean read (auth.usage).
 const gone = (msg) => Object.assign(new Error(msg), { gone: true })
 const EARLY_MS = 2 * 60 * 1000 // a token this close to its end is refreshed before a request
 const LEAD_MS = 10 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
@@ -414,7 +415,10 @@ function goG(x) {
 
 // usageOf is the allowance Get-Usage-Limits tells, as magpie's built-in
 // said it: the account's email, the credits of each allowance, the month's and a free trial's
-// while it runs.
+// while it runs. Each window carries its count (amount, limit, unit), so
+// magpie can say what is left of it when the user shows what is left
+// (#408): display alone is the vendor's text, which magpie can't turn
+// round.
 function usageOf(l) {
   const at = (secs) => (secs > 0 ? new Date(Math.trunc(secs) * 1000).toISOString() : undefined)
   const count = (used, limit) => used.toFixed(2).replace(/0+$/, "").replace(/\.$/, "") + " / " + goG(limit)
@@ -424,13 +428,14 @@ function usageOf(l) {
     const t = u?.freeTrialInfo
     if (t && String(t.freeTrialStatus ?? "").toUpperCase() === "ACTIVE" && num(t.usageLimitWithPrecision) > 0) {
       const used = num(t.currentUsageWithPrecision), limit = num(t.usageLimitWithPrecision)
-      windows.push({ name: "Free trial", used: (100 * used) / limit, resetsAt: at(num(t.freeTrialExpiry)), display: count(used, limit) })
+      windows.push({ name: "Free trial", used: (100 * used) / limit, resetsAt: at(num(t.freeTrialExpiry)), display: count(used, limit),
+        amount: used, limit, unit: "credits" })
     }
     const used = num(u?.currentUsageWithPrecision), limit = num(u?.usageLimitWithPrecision)
     if (limit <= 0) continue
     const reset = num(u?.nextDateReset) || num(l?.nextDateReset)
     windows.push({ name: u?.displayNamePlural || u?.displayName || "Credits", used: (100 * used) / limit, resetsAt: at(reset),
-      display: count(used, limit), span: 30 * 24 * 3600 })
+      display: count(used, limit), amount: used, limit, unit: "credits", span: 30 * 24 * 3600 })
   }
   const email = l?.userInfo?.email
   return { plan: planName(l?.subscriptionInfo?.subscriptionTitle), ...(typeof email === "string" && email ? { user: email } : {}), windows }
@@ -569,6 +574,24 @@ function account(client) {
 // ---- models ----------------------------------------------------------------------
 
 const windows = new Map() // a model's context, as Kiro last listed it
+const natives = new Map() // a model's effort levels sent as fields, as Kiro last listed them (nativeOf)
+
+// nativeOf is what a model's additionalModelRequestFieldsSchema in Kiro's
+// list offers, read as Kiro IDE reads it: the effort levels in the enum of
+// output_config's (or reasoning's) effort, and whether thinking.type may be
+// "adaptive". A model offering both is sent the caller's effort in
+// additionalModelRequestFields, as the IDE sends it; any other keeps the
+// <max_thinking_length> budget (#538).
+function nativeOf(s) {
+  if (!s || typeof s !== "object" || Array.isArray(s)) return undefined
+  const types = s.properties?.thinking?.properties?.type?.enum
+  if (!Array.isArray(types) || !types.includes("adaptive")) return undefined
+  for (const path of ["output_config", "reasoning"]) {
+    const levels = s.properties?.[path]?.properties?.effort?.enum
+    if (Array.isArray(levels) && levels.length) return { path, levels }
+  }
+  return undefined
+}
 
 const thinks = (id) => /claude/i.test(id) || id === "auto"
 // the levels a thinking model offers, as the built-in thinks them (xhigh as
@@ -648,6 +671,7 @@ async function listModels(a) {
   }
   if (!list.length) throw new Error("Kiro listed no models")
   for (const m of list) windows.set(m.id, m.context)
+  for (const m of out?.models ?? []) if (m?.modelId) natives.set(m.modelId, nativeOf(m.additionalModelRequestFieldsSchema))
   return list
 }
 
@@ -706,6 +730,106 @@ function addImage(images, p) {
   if (p.source?.type === "base64" && p.source.data) images.push({ format: imageFormat(p.source.media_type), source: { bytes: p.source.data } })
 }
 
+// ---- images over Kiro's size limit ---------------------------------------------------
+//
+// Kiro turns away an image whose Base64 is over 5 MiB, counted on the
+// encoded string, not the file (magpie-community/plugins#428):
+//   messages.130.content.2.image.source.base64: image exceeds 5 MB maximum:
+//   5561904 bytes > 5242880 bytes (IMAGE_SIZE_EXCEEDED)
+// 5561904 is that image's Base64 length (4,171,428 bytes decoded), so the
+// largest file that fits is 3,932,160 bytes. kiro-cli's own gate is 10 MB of
+// raw file (MAX_IMAGE_SIZE, aws/amazon-q-developer-cli chat/consts.rs), which
+// lets such an image in and then every later turn fails on it
+// (kirodotdev/Kiro#11497). The image stays in history, so each turn would
+// fail the same way: an image over the limit is made smaller on the request
+// being sent, and one that can't be is replaced by a note.
+const IMAGE_LIMIT = 5 * 1024 * 1024 // Base64 characters
+const IMAGE_EDGE = 2000 // a shrunk image's long edge: Kiro's web app's limit (kirodotdev/Kiro#8884), above what Claude looks at
+const IMAGE_MIN_EDGE = 256
+const IMAGE_MAX_PIXELS = 50_000_000 // a decoded image is ~4 bytes a pixel: a 200MB ceiling, and a header claiming more is refused unread
+const IMAGE_MAX_INPUT = 64 * 1024 * 1024 // Base64 characters looked at all
+const IMAGE_DEADLINE = 30_000 // ms one image may take
+const fitted = new Map() // sha256 of the Base64 → Promise of { format, bytes } or { note }, newest last
+const FITTED_KEEP = 4
+
+const mib = (n) => (n / (1024 * 1024)).toFixed(1) + " MB"
+
+// shrink tries, in order, the image's own kind at Claude's size, then a
+// lossy kind (WebP keeps transparency, JPEG stays JPEG) smaller each time,
+// until the Base64 fits.
+async function shrink(b64) {
+  const I = globalThis.Bun?.Image
+  if (typeof I !== "function") return { note: "this plugin host can't resize images" }
+  const started = Date.now()
+  const raw = Buffer.from(b64, "base64")
+  let meta
+  try {
+    meta = await new I(raw, { maxPixels: IMAGE_MAX_PIXELS }).metadata()
+  } catch (e) {
+    return { note: e?.code === "ERR_IMAGE_TOO_MANY_PIXELS" ? "it has too many pixels to resize" : "it couldn't be read as an image" }
+  }
+  const long = Math.max(meta.width, meta.height)
+  const jpeg = meta.format === "jpeg"
+  const own = jpeg ? { format: "jpeg", opts: { quality: 85 } } : meta.format === "webp" ? { format: "webp", opts: { quality: 85 } } : { format: "png", opts: { compressionLevel: 9 } }
+  const lossy = (quality) => (jpeg ? { format: "jpeg", opts: { quality } } : { format: "webp", opts: { quality } })
+  const tries = [{ edge: Math.min(long, IMAGE_EDGE), ...own }, { edge: Math.min(long, IMAGE_EDGE), ...lossy(80) }]
+  for (let edge = Math.min(long, IMAGE_EDGE) * 0.7; edge >= IMAGE_MIN_EDGE; edge *= 0.7) tries.push({ edge: Math.round(edge), ...lossy(75) })
+  for (const t of tries) {
+    if (Date.now() - started > IMAGE_DEADLINE) return { note: "resizing it took too long" }
+    let out
+    try {
+      let img = new I(raw, { maxPixels: IMAGE_MAX_PIXELS })
+      if (t.edge < long) img = img.resize(t.edge, t.edge, { fit: "inside", withoutEnlargement: true })
+      out = await img[t.format](t.opts).toBase64()
+    } catch (e) {
+      if (e?.code === "ERR_IMAGE_FORMAT_UNSUPPORTED") continue
+      return { note: "it couldn't be resized" }
+    }
+    if (out.length <= IMAGE_LIMIT) return { format: t.format, bytes: out }
+  }
+  return { note: "it couldn't be made small enough" }
+}
+
+function fitOne(b64) {
+  const key = createHash("sha256").update(b64).digest("hex")
+  let p = fitted.get(key)
+  if (p) fitted.delete(key) // kept as the newest below
+  else p = b64.length > IMAGE_MAX_INPUT ? Promise.resolve({ note: "it is too large to resize" }) : shrink(b64).catch(() => ({ note: "it couldn't be resized" }))
+  fitted.set(key, p)
+  while (fitted.size > FITTED_KEEP) fitted.delete(fitted.keys().next().value)
+  return p
+}
+
+// fitImages brings every image left in a built request under Kiro's limit,
+// in place: the request is the plugin's own copy, never the caller's. An
+// image already under it is sent as it is.
+async function fitImages(out) {
+  const s = out.conversationState
+  const users = [...(s.history ?? []).map((e) => e.userInputMessage), s.currentMessage.userInputMessage].filter(Boolean)
+  for (const u of users) {
+    if (!u.images?.length) continue
+    const kept = []
+    const notes = []
+    for (const img of u.images) {
+      const b64 = img.source?.bytes
+      if (typeof b64 !== "string" || b64.length <= IMAGE_LIMIT) {
+        kept.push(img)
+        continue
+      }
+      const r = await fitOne(b64)
+      if (r.bytes) kept.push({ ...img, format: r.format, source: { ...img.source, bytes: r.bytes } })
+      else
+        notes.push(
+          `[An image (${img.format}, ${mib(b64.length)} as Base64) was left out of this message: Kiro takes at most ${mib(IMAGE_LIMIT)} per image, and ${r.note}.]`,
+        )
+    }
+    if (kept.length) u.images = kept
+    else delete u.images
+    if (notes.length) u.content = joinNonEmpty(u.content, notes.join("\n"))
+  }
+  return out
+}
+
 const textOf = (c) =>
   typeof c === "string" ? c : Array.isArray(c) ? c.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("\n\n") : ""
 const joinNonEmpty = (a, b) => (a && b ? a + "\n\n" + b : a + b)
@@ -729,6 +853,17 @@ function thinking(req, model) {
   return 20000
 }
 
+// nativeFields is the additionalModelRequestFields a thinking request is
+// sent with when Kiro's list says the model takes its effort as a field:
+// adaptive thinking at the caller's level, so xhigh and max reach the model
+// as two levels rather than one 50000 budget (#538). undefined otherwise.
+function nativeFields(req, model) {
+  const n = natives.get(model)
+  const effort = req.output_config?.effort
+  if (!n || typeof effort !== "string" || !n.levels.includes(effort) || !thinking(req, model)) return undefined
+  return { thinking: { type: "adaptive" }, [n.path]: { effort } }
+}
+
 // formatText is the structured output a request asks for, said in words:
 // Anthropic's output_config.format (or the AI SDK's output_format) with a
 // JSON schema, "" when it asks for none. A JSON object with no schema
@@ -740,8 +875,62 @@ function formatText(req) {
   return "Respond with a single JSON value and nothing else, matching this JSON schema:\n" + JSON.stringify(f.schema) + "."
 }
 
-// buildKiro is the body of a generateAssistantResponse call.
+// inputSchema is a tool's input schema as Kiro takes it: one whose root
+// says type "object". Kiro answers 400 REQUEST_BODY_INVALID to a root with
+// properties and no type (Haiku 5.5: the same schema with the type added
+// is called), and to {}. A tool's input is always an object, so a root
+// that says no type, or object-or-null, is said to be one; the rest of it
+// (a union at its root, its properties, $refs, nullable) is sent as given,
+// and a root that says another type is left as the caller said it. The
+// caller's schema isn't changed: the root is copied.
+function inputSchema(s) {
+  if (!s || typeof s !== "object" || Array.isArray(s) || !Object.keys(s).length) return { type: "object", properties: {} }
+  if (s.type === undefined) return { type: "object", ...s }
+  if (Array.isArray(s.type) && s.type.includes("object") && s.type.every((t) => t === "object" || t === "null")) return { ...s, type: "object" }
+  return s
+}
+
+// buildKiro is the body of a generateAssistantResponse call, as it is
+// before its images are fitted (kiroBody).
 function buildKiro(req, model, profile, budget) {
+  return JSON.stringify(kiroRequest(req, model, profile, budget))
+}
+
+// kiroBody is the body sent: buildKiro's, with every image it keeps under
+// Kiro's size limit.
+async function kiroBody(req, model, profile, budget) {
+  return JSON.stringify(await fitImages(kiroRequest(req, model, profile, budget)))
+}
+
+// UNDERSTOOD is the reply Kiro IDE puts in its history where a turn has
+// none of its own, before the message being answered
+const UNDERSTOOD = "Understood."
+
+// contextFirst is a conversation that ends in system messages (Claude
+// Code's environment context, sent after the user's question) with that
+// context said first: a turn of its own, answered by Kiro IDE's
+// placeholder, before the question, which stays the message being
+// answered rather than the head of "question, then context" (#538). The
+// instructions' own field isn't used: Kiro refuses it ("systemPrompt field
+// is not enabled for this user"). A question carrying tool results, or
+// following tool calls, keeps the context in it as before, so no call is
+// parted from its result.
+function contextFirst(messages) {
+  let end = messages.length
+  while (end > 0 && messages[end - 1]?.role === "system") end--
+  if (end === messages.length) return messages
+  let start = end
+  while (start > 0 && messages[start - 1]?.role === "user") start--
+  const parts = (m) => (typeof m?.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m?.content) ? m.content : [])
+  const context = messages.slice(end)
+  if (start === end || !context.some((m) => parts(m).some((p) => p?.type !== "text" || p.text))) return messages
+  const turn = messages.slice(start, end)
+  if (turn.some((m) => parts(m).some((p) => p?.type === "tool_result"))) return messages
+  if (parts(messages[start - 1]).some((p) => p?.type === "tool_use" || p?.type === "server_tool_use" || p?.type === "web_search_tool_result")) return messages
+  return [...messages.slice(0, start), ...context.map((m) => ({ ...m, role: "user" })), { role: "assistant", content: UNDERSTOOD }, ...turn]
+}
+
+function kiroRequest(req, model, profile, budget) {
   const entries = []
   // the messages the caller marked for its prompt cache (cache_control),
   // which go to Kiro as a cachePoint on the message they end up in (#110)
@@ -750,26 +939,53 @@ function buildKiro(req, model, profile, budget) {
     if (parts.some((p) => p?.cache_control)) marked.add(msg)
   }
   const user = () => ({ content: "", modelId: model, origin: "KIRO_CLI" })
-  for (const m of req.messages ?? []) {
+  const resultsOnly = new WeakSet() // the messages made to carry a reply's web search results
+  for (const m of contextFirst(req.messages ?? [])) {
     const parts = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content ?? []
     const texts = []
     if (m.role === "assistant") {
-      const a = { content: "", toolUses: [] }
+      // a web search's result is in the reply itself (server_tool_use, then
+      // web_search_tool_result): to Kiro the reply up to it is a turn of its
+      // own, answered by a message carrying the result
+      let a = { content: "", toolUses: [] }
+      let last = null
+      const flush = () => {
+        a.content = texts.splice(0).join("\n\n")
+        if (!a.content && !a.toolUses.length) return // what only thought
+        const prev = entries.at(-1)?.assistantResponseMessage
+        if (prev) {
+          prev.content = joinNonEmpty(prev.content, a.content)
+          prev.toolUses.push(...a.toolUses)
+        } else entries.push({ assistantResponseMessage: a })
+        last = prev ?? a
+        a = { content: "", toolUses: [] }
+      }
       for (const p of parts) {
         if (p?.type === "text" && p.text) texts.push(p.text)
         else if (p?.type === "tool_use") {
           const input = p.input && typeof p.input === "object" && !Array.isArray(p.input) ? p.input : {}
           a.toolUses.push({ name: toolName(p.name), toolUseId: toolID(p.id), input })
+        } else if (p?.type === "server_tool_use" && p.name === SEARCH_NAME) {
+          const input = p.input && typeof p.input === "object" && !Array.isArray(p.input) ? p.input : {}
+          a.toolUses.push({ name: SEARCH_NAME, toolUseId: toolID(p.id), input })
+        } else if (p?.type === "web_search_tool_result") {
+          flush()
+          const text = searchedText(p)
+          const result = { toolUseId: toolID(p.tool_use_id), status: text === null ? "error" : "success",
+            content: [{ text: text ?? searched.get(p.tool_use_id) ?? searchFailedText(p.content?.error_code) }] }
+          // parallel searches (both calls, then both results, as
+          // Anthropic answers them) are answered in one message
+          const prev = entries.at(-1)?.userInputMessage
+          if (prev && resultsOnly.has(prev)) prev.userInputMessageContext.toolResults.push(result)
+          else {
+            const u = { ...user(), images: [], userInputMessageContext: { toolResults: [result] } }
+            resultsOnly.add(u)
+            entries.push({ userInputMessage: u })
+          }
         }
       }
-      a.content = texts.join("\n\n")
-      if (!a.content && !a.toolUses.length) continue // a turn that only thought
-      const prev = entries.at(-1)?.assistantResponseMessage
-      if (prev) {
-        prev.content = joinNonEmpty(prev.content, a.content)
-        prev.toolUses.push(...a.toolUses)
-      } else entries.push({ assistantResponseMessage: a })
-      mark(prev ?? a, parts)
+      flush()
+      if (last) mark(last, parts)
       continue
     }
     const u = user()
@@ -855,7 +1071,9 @@ function buildKiro(req, model, profile, budget) {
   // end of the instructions, as magpie's built-in tells it (inSystem)
   const format = formatText(req)
   if (format) system = system ? system + "\n\n" + format : format
-  if (budget) system = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>` + (system ? "\n" + system : "")
+  // a level Kiro takes as a field is sent as one, not also as a budget
+  const native = budget ? nativeFields(req, model) : undefined
+  if (budget && !native) system = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>` + (system ? "\n" + system : "")
   if (system) entries[0].userInputMessage.content = system + "\n\n" + entries[0].userInputMessage.content
   if (Array.isArray(req.system)) mark(entries[0].userInputMessage, req.system)
 
@@ -865,11 +1083,19 @@ function buildKiro(req, model, profile, budget) {
   const tools = []
   const offered = new Set()
   const EMPTY = { type: "object", properties: {} }
+  const hosted = hostedSearch(req)
   for (const t of req.tools ?? []) {
+    if (hosted && t === hosted.tool) {
+      // Kiro's own web search, run here when the model calls it (searching)
+      offered.add(SEARCH_NAME)
+      tools.push({ toolSpecification: SEARCH_SPEC })
+      if (t.cache_control) tools.push({ cachePoint: { type: "default" } })
+      continue
+    }
     if (!t?.name || (t.type && t.type !== "custom" && !t.input_schema)) continue // server tools Kiro hasn't
     const name = toolName(t.name)
     offered.add(name)
-    tools.push({ toolSpecification: { name, description: t.description || t.name, inputSchema: { json: t.input_schema ?? EMPTY } } })
+    tools.push({ toolSpecification: { name, description: t.description || t.name, inputSchema: { json: inputSchema(t.input_schema) } } })
     if (t.cache_control) tools.push({ cachePoint: { type: "default" } })
   }
   for (const e of entries)
@@ -897,24 +1123,28 @@ function buildKiro(req, model, profile, budget) {
   if (entries.length > 1) state.history = entries.slice(0, -1)
   const out = { conversationState: state, agentMode: "vibe" }
   if (profile) out.profileArn = profile
-  return JSON.stringify(out)
+  if (native) out.additionalModelRequestFields = native
+  return out
+}
+
+// sdkHeaders are the AWS SDK's headers on a call to Kiro's runtime, as
+// kiro-cli's client sends them: who is calling, and as which client.
+function sdkHeaders(a) {
+  const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-${randomUUID().replaceAll("-", "")}`
+  return {
+    ...authHeaders(a),
+    "amz-sdk-invocation-id": randomUUID(),
+    "amz-sdk-request": "attempt=1; max=1",
+    "x-amz-user-agent": ua,
+    "User-Agent": ua,
+  }
 }
 
 function sendKiro(a, body, signal) {
-  const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-${randomUUID().replaceAll("-", "")}`
   return fetch(runtime(a.region) + "/generateAssistantResponse", {
     method: "POST",
-    headers: {
-      ...authHeaders(a),
-      "Content-Type": "application/json",
-      Accept: "application/vnd.amazon.eventstream",
-      "x-amzn-codewhisperer-optout": "true",
-      "amz-sdk-invocation-id": randomUUID(),
-      "amz-sdk-request": "attempt=1; max=1",
-      "x-amzn-kiro-agent-mode": "vibe",
-      "x-amz-user-agent": ua,
-      "User-Agent": ua,
-    },
+    headers: { ...sdkHeaders(a), "x-amzn-codewhisperer-optout": "true", "x-amzn-kiro-agent-mode": "vibe",
+      "Content-Type": "application/json", Accept: "application/vnd.amazon.eventstream" },
     body,
     signal,
   })
@@ -1097,7 +1327,12 @@ async function* events(body, model, budget) {
   let tool = ""
   let tools = 0
   let stop = ""
-  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  // reported: Kiro sent a tokenUsage. It doesn't today: a reply has a
+  // contextUsageEvent and a meteringEvent (credits) and nothing more, and
+  // kiro-cli 2.32's own trace log shows its MetadataEvent with every token
+  // count None, while a repeated prompt is billed about half the credits,
+  // so Kiro does cache and doesn't say how much
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reported: false }
   let pct = 0
   let said = 0
   let failed = ""
@@ -1147,6 +1382,7 @@ async function* events(body, model, budget) {
         if (m.stopReason) stop = m.stopReason
         const tu = m.tokenUsage
         if (tu && typeof tu === "object") {
+          usage.reported = true
           usage.input += tu.uncachedInputTokens || tu.inputTokens || 0
           usage.output += tu.outputTokens || 0
           usage.cacheRead += tu.cacheReadInputTokens || 0
@@ -1192,11 +1428,17 @@ function finished(content) {
   return content
 }
 
+// anthropicUsage is the usage in Messages' words. With no tokenUsage from
+// Kiro the input is reckoned from how full the context is, and what of it
+// Kiro read from its cache is unknown, not 0: the cache fields are left
+// out and magpie is told so (magpie_cache_unknown), so it shows no hit
+// rate rather than 0%.
 const anthropicUsage = (u) => ({
-  input_tokens: u.input,
-  output_tokens: u.output,
-  cache_read_input_tokens: u.cacheRead,
-  cache_creation_input_tokens: u.cacheWrite,
+  ...(u.reported
+    ? { input_tokens: u.input, output_tokens: u.output, cache_read_input_tokens: u.cacheRead, cache_creation_input_tokens: u.cacheWrite }
+    : { input_tokens: u.input, output_tokens: u.output, magpie_cache_unknown: true }),
+  // the hosted web searches made (searching)
+  ...(u.searches ? { server_tool_use: { web_search_requests: u.searches } } : {}),
 })
 
 // quotaWords are magpie's (internal/gateway/fallback.go): how a vendor says
@@ -1230,11 +1472,16 @@ async function reply(it, model, stream, names = new Map()) {
         else add({ type: "thinking", thinking: e.text, signature: "" })
       } else if (e.kind === "sig") {
         if (last?.type === "thinking") last.signature += e.text
-      } else if (e.kind === "toolStart") add({ type: "tool_use", id: e.id, name: names.get(e.name) ?? e.name, input: "" })
+      } else if (e.kind === "serverTool") add({ type: "server_tool_use", id: e.id, name: e.name, input: e.input })
+      else if (e.kind === "searched") add({ type: "web_search_tool_result", tool_use_id: e.id, content: e.content })
+      else if (e.kind === "toolStart") add({ type: "tool_use", id: e.id, name: names.get(e.name) ?? e.name, input: "" })
       else if (e.kind === "toolArgs") {
         if (last?.type === "tool_use") last.input += e.text
       } else if (e.kind === "error") {
-        // with none of the answer said, a status; else what was said
+        // with none of the answer said, a status; else what was said. A
+        // turn after a web search that failed is a status even so: what
+        // was said is the searches, without the answer they were for
+        if (e.status) return errorResponse(e.status, e.text)
         if (!content.length) return failedBefore(e.text)
         return Response.json({ id, type: "message", role: "assistant", model, content: finished(content), stop_reason: "end_turn",
           stop_sequence: null, usage: anthropicUsage({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }) })
@@ -1296,6 +1543,15 @@ async function reply(it, model, stream, names = new Map()) {
         case "toolArgs":
           if (open === "tool") ctl.enqueue(sse("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: e.text } }))
           break
+        case "serverTool":
+          begin("server", { type: "server_tool_use", id: e.id, name: e.name, input: {} })
+          ctl.enqueue(sse("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: JSON.stringify(e.input) } }))
+          close()
+          break
+        case "searched":
+          begin("searched", { type: "web_search_tool_result", tool_use_id: e.id, content: e.content })
+          close()
+          break
         case "error":
           close()
           ctl.enqueue(sse("error", { error: { type: "api_error", message: e.text } }))
@@ -1314,6 +1570,222 @@ async function reply(it, model, stream, names = new Map()) {
   return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } })
 }
 
+// ---- web search: Kiro's own, for Anthropic's hosted tool ----------------------------
+//
+// A request offering Anthropic's hosted web search ({type:
+// "web_search_20250305", name: "web_search"}) has it searched by Kiro's own
+// web search, as kiro-cli (2.35) searches: its runtime's InvokeMCP
+// operation (AWS JSON 1.0, x-amz-target
+// AmazonCodeWhispererStreamingService.InvokeMCP, POSTed to the runtime's
+// root) carrying a JSON-RPC tools/call of web_search, with the account's
+// token and profile. The model is offered kiro-cli's web_search tool; a call
+// it makes to it is searched here, the pages found go back to it as the
+// call's result and it is asked again, and the caller is answered with
+// server_tool_use and web_search_tool_result blocks and the answer, as
+// Anthropic answers. The caller's own tools are never run here.
+
+const SEARCH_TYPE = "web_search_20250305"
+const SEARCH_NAME = "web_search"
+const MCP_TARGET = "AmazonCodeWhispererStreamingService.InvokeMCP"
+const SEARCH_USES = 10 // searches one request may make at most, max_uses or not
+const SEARCH_QUERY = 200 // characters: what kiro-cli's web_search says its query takes
+const SEARCH_TIMEOUT = 30_000
+const SEARCH_BODY = 1 << 20 // bytes of a search's answer read at most
+const SEARCH_RESULTS = 20
+// PURPOSE is what kiro-cli's agent adds to every tool it offers: the model
+// says why it calls it. It isn't searched for, nor shown to the caller.
+const PURPOSE = "__tool_use_purpose"
+// kiro-cli's web_search, as its agent offers it (2.35's own strings)
+const SEARCH_SPEC = {
+  name: SEARCH_NAME,
+  description: "WebSearch looks up information that is outside the model's training data or cannot be reliably inferred from the current codebase/context.",
+  inputSchema: { json: { type: "object", properties: {
+    query: { type: "string", maxLength: SEARCH_QUERY, description: "Search query (max 200 chars) - use concise keywords, not full sentences" },
+    [PURPOSE]: { type: "string", description: "A brief explanation why you are making this tool use." },
+  }, required: ["query"] } },
+}
+
+// hostedSearch is the request's hosted web search, as it asks for it: the
+// tool, how many searches it allows, and the domains it keeps or drops.
+// null when it offers none; { error } when it asks for what can't be done.
+function hostedSearch(req) {
+  // magpie takes any tool whose type begins web_search for a web search and,
+  // as this provider searches (config: searches), passes it here rather
+  // than searching for it: one this can't search with is refused, not
+  // dropped, so a search asked for isn't silently gone
+  const searches = (req.tools ?? []).filter((t) => typeof t?.type === "string" && t.type.startsWith("web_search"))
+  const odd = searches.find((t) => t.type !== SEARCH_TYPE || t.name !== SEARCH_NAME)
+  if (odd) return { error: `the hosted web search on Kiro is {type: "${SEARCH_TYPE}", name: "${SEARCH_NAME}"}, not {type: ${JSON.stringify(odd.type)}, name: ${JSON.stringify(odd.name ?? null)}}; ` +
+    "set provider.kiro.searches to false to have magpie search for it" }
+  if (searches.length > 1) return { error: "web_search is offered more than once" }
+  const tool = searches[0]
+  if (!tool) return null
+  if ((req.tools ?? []).some((t) => t !== tool && toolName(t?.name ?? "") === SEARCH_NAME))
+    return { error: "two tools are named web_search: the hosted web search and another" }
+  // Kiro's search has no place for where the user is
+  if (tool.user_location) return { error: "web_search's user_location isn't supported on Kiro" }
+  const list = (v) => (Array.isArray(v) ? v.filter((d) => typeof d === "string" && d.trim()).map((d) => d.trim()) : [])
+  const allowed = list(tool.allowed_domains)
+  const blocked = list(tool.blocked_domains)
+  if (allowed.length && blocked.length) return { error: "web_search takes allowed_domains or blocked_domains, not both" }
+  // a max_uses given is a whole number of at least 1, as Anthropic's API
+  // takes it; none given is SEARCH_USES, and none is more
+  if (tool.max_uses != null && !(Number.isInteger(tool.max_uses) && tool.max_uses > 0))
+    return { error: "web_search's max_uses must be a whole number of at least 1" }
+  return { tool, uses: Math.min(tool.max_uses ?? SEARCH_USES, SEARCH_USES), allowed, blocked }
+}
+
+// a domain as Anthropic's allowed_domains and blocked_domains name one:
+// the host and its subdomains, and under a path when it gives one (a
+// host's case doesn't matter, a path's does)
+function inDomain(url, domain) {
+  const slash = domain.indexOf("/")
+  const host = (slash < 0 ? domain : domain.slice(0, slash)).replace(/^\*\./, "").toLowerCase()
+  const path = slash < 0 ? "" : domain.slice(slash)
+  const h = url.hostname.toLowerCase()
+  return (h === host || h.endsWith("." + host)) && (!path || url.pathname.startsWith(path))
+}
+
+// searched is what each search found, by its server_tool_use id, as the
+// model was given it: a conversation sent again with the result has its
+// snippets told the model again. Bounded; one not kept is told from the
+// result's titles and URLs.
+const searched = new Map()
+const SEARCHED_KEEP = 64
+const keepSearched = (id, text) => {
+  searched.set(id, text)
+  if (searched.size > SEARCHED_KEEP) searched.delete(searched.keys().next().value)
+}
+
+const SEARCH_ERRORS = {
+  invalid_tool_input: "the search query was missing or not text",
+  query_too_long: `the search query was longer than ${SEARCH_QUERY} characters`,
+  max_uses_exceeded: "no more searches are allowed for this request; answer with what was found",
+  too_many_requests: "the search service is rate limited",
+  unavailable: "the search service is unavailable",
+}
+const searchFailedText = (code) => "Web search failed: " + (SEARCH_ERRORS[code] ?? String(code ?? "unavailable"))
+
+// searchedText is a web_search_tool_result told as text, for the model;
+// null when it is an error.
+function searchedText(p) {
+  if (!Array.isArray(p?.content)) return null
+  const kept = searched.get(p.tool_use_id)
+  if (kept) return kept
+  if (!p.content.length) return "No results."
+  return p.content.filter((r) => r?.url).map((r, i) => `[${i + 1}] ${r.title || r.url}\nURL: ${r.url}` +
+    (r.page_age ? `\nPublished: ${r.page_age}` : "")).join("\n\n")
+}
+
+// secretless is a message with anything like a token taken out, and short.
+const secretless = (s) => String(s ?? "").replace(/Bearer\s+\S+/gi, "Bearer …").replace(/\b(ksk_|aoa|aor)[A-Za-z0-9._\-]{8,}/g, "…").slice(0, 200)
+
+// bounded reads at most limit bytes of a body: null past it.
+async function bounded(res, limit) {
+  if (!res.body) return ""
+  const reader = res.body.getReader()
+  const parts = []
+  let n = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    n += value.length
+    if (n > limit) {
+      await reader.cancel().catch(() => {})
+      return null
+    }
+    parts.push(value)
+  }
+  return new TextDecoder().decode(Buffer.concat(parts))
+}
+
+// webSearch searches with Kiro's web_search through InvokeMCP: { results }
+// (Anthropic's web_search_result blocks) and the text the model is given,
+// or { code } (a web_search_tool_result_error's error_code) and why, or
+// { status: 403 } for a token Kiro turned down. An abort is thrown. The
+// profile is InvokeMCPRequest's profileArn, which AWS JSON 1.0 sends in the
+// body: without it there Kiro answers 400 "profileArn is required for this
+// request", the x-amzn-kiro-profile-arn header (its httpHeader binding in
+// Kiro's REST model, sent too, as kiro-cli 2.35 sends it) notwithstanding.
+// An API key names no profile, as kiro-cli names none for one. The tool's
+// arguments are its query alone.
+async function webSearch(a, query, hosted, signal) {
+  const timeout = AbortSignal.timeout(SEARCH_TIMEOUT)
+  const both = signal ? AbortSignal.any([signal, timeout]) : timeout
+  const body = { jsonrpc: "2.0", id: "1", method: "tools/call", ...(a.profile ? { profileArn: a.profile } : {}),
+    params: { name: SEARCH_NAME, arguments: { query } } }
+  let res, text
+  try {
+    res = await fetch(runtime(a.region) + "/", { method: "POST", body: JSON.stringify(body), signal: both,
+      headers: { ...sdkHeaders(a), "amz-sdk-request": "attempt=1; max=3", "Content-Type": "application/x-amz-json-1.0",
+        "x-amz-target": MCP_TARGET, ...(a.profile ? { "x-amzn-kiro-profile-arn": a.profile } : {}) } })
+    if (res.status === 403) {
+      await res.body?.cancel().catch(() => {})
+      return { status: 403 }
+    }
+    text = await bounded(res, SEARCH_BODY)
+  } catch (e) {
+    if (signal?.aborted) throw e
+    return { code: "unavailable", why: timeout.aborted ? "the search timed out" : "the search service couldn't be reached: " + secretless(e?.message) }
+  }
+  if (!res.ok) return { code: res.status === 429 ? "too_many_requests" : "unavailable", why: `the search service answered ${res.status}` }
+  if (text === null) return { code: "unavailable", why: "the search's answer was too long" }
+  return searchAnswer(text, hosted)
+}
+
+// searchAnswer reads InvokeMCP's answer, { jsonrpc, id, result, error }: the
+// result is the tools/call's, its content a text block of the search's JSON.
+function searchAnswer(text, hosted) {
+  let m
+  try {
+    m = JSON.parse(text)
+  } catch {}
+  const bad = (why) => ({ code: "unavailable", why })
+  if (!m || typeof m !== "object") return bad("the search's answer wasn't JSON")
+  if (m.error) return bad("the search failed: " + secretless(m.error.message ?? m.error.code))
+  // a document, which may come as its JSON text
+  let result = m.result
+  if (typeof result === "string")
+    try {
+      result = JSON.parse(result)
+    } catch {}
+  const content = Array.isArray(result?.content) ? result.content : []
+  const out = content.find((c) => c?.type === "text" && typeof c.text === "string")
+  if (result?.isError) return bad("the search failed: " + secretless(out?.text))
+  let r
+  try {
+    r = JSON.parse(out?.text ?? "")
+  } catch {
+    return bad("the search's answer wasn't one it reads")
+  }
+  if (!r || typeof r !== "object" || !Array.isArray(r.results)) return bad("the search's answer had no results list")
+  if (r.error) return bad("the search failed: " + secretless(typeof r.error === "string" ? r.error : r.error.message))
+  const results = []
+  const lines = []
+  for (const h of r.results) {
+    let url
+    try {
+      url = new URL(String(h?.url ?? ""))
+    } catch {
+      continue
+    }
+    if (!/^https?:$/.test(url.protocol)) continue
+    // Kiro's search has no domain filter: what it found outside the domains
+    // asked for is left out
+    if (hosted.allowed.length && !hosted.allowed.some((d) => inDomain(url, d))) continue
+    if (hosted.blocked.some((d) => inDomain(url, d))) continue
+    const title = typeof h.title === "string" && h.title.trim() ? h.title.trim() : url.href
+    const age = typeof h.publishedDate === "string" && h.publishedDate ? h.publishedDate.slice(0, 64) : null
+    // encrypted_content is the searcher's sealed copy of the page: Kiro
+    // has none, and none is made up (as magpie's searchResultBlock)
+    results.push({ type: "web_search_result", title, url: url.href, encrypted_content: "", page_age: age })
+    const snippet = typeof h.snippet === "string" ? h.snippet.trim().slice(0, 2000) : ""
+    lines.push(`[${results.length}] ${title}\nURL: ${url.href}` + (age ? `\nPublished: ${age}` : "") + (snippet ? `\n${snippet}` : ""))
+    if (results.length >= SEARCH_RESULTS) break
+  }
+  return { results, text: lines.length ? lines.join("\n\n") : "No results." }
+}
+
 // generate answers a Messages request through Kiro's API: once more,
 // refreshed, when Kiro turns the token down (403). As the built-in: no
 // credentials is a 401, a failed refresh after the 403 a 502; none marks
@@ -1321,39 +1793,176 @@ async function reply(it, model, stream, names = new Map()) {
 async function generate(creds, auth, req, signal) {
   const model = String(req.model ?? "auto")
   const budget = thinking(req, model)
+  const hosted = hostedSearch(req)
+  if (hosted?.error) return errorResponse(400, hosted.error)
+  const first = await ask(creds, auth, req, model, budget, signal)
+  if (!first.res) return errorResponse(first.status, first.message)
+  const it = hosted ? searching(creds, auth, req, model, budget, signal, hosted, first) : events(first.res.body, model, budget)
+  return kept(await reply(it, model, req.stream === true, toolNames(req)))
+}
+
+// ask sends one turn to Kiro: { res, a }, a 200, or the { status, message }
+// of a failure.
+async function ask(creds, auth, req, model, budget, signal) {
   let a
   try {
     a = await creds(auth)
   } catch (e) {
-    return errorResponse(401, e.message)
+    return { status: 401, message: e.message }
   }
   let res
   try {
-    res = await sendKiro(a, buildKiro(req, model, a.profile, budget), signal)
+    res = await sendKiro(a, await kiroBody(req, model, a.profile, budget), signal)
   } catch (e) {
     if (e?.name === "AbortError") throw e
-    return errorResponse(502, e.message)
+    return { status: 502, message: e.message }
   }
   if (res.status === 403) {
     await res.body?.cancel()
     try {
       a = await creds(auth, true)
     } catch (e) {
-      return errorResponse(502, e.message)
+      return { status: 502, message: e.message }
     }
     try {
-      res = await sendKiro(a, buildKiro(req, model, a.profile, budget), signal)
+      res = await sendKiro(a, await kiroBody(req, model, a.profile, budget), signal)
     } catch (e) {
       if (e?.name === "AbortError") throw e
-      return errorResponse(502, e.message)
+      return { status: 502, message: e.message }
     }
   }
   if (!res.ok) {
     // Kiro's own 401 is passed on, as the built-in did, the sign-in kept
-    const f = failure(res.status, (await res.text()).slice(0, 1 << 20))
-    return errorResponse(f.status, f.message)
+    return failure(res.status, (await res.text()).slice(0, 1 << 20))
   }
-  return kept(await reply(events(res.body, model, budget), model, req.stream === true, toolNames(req)))
+  return { res, a }
+}
+
+const aborted = () => Object.assign(new Error("the request was cancelled"), { name: "AbortError" })
+
+// searching is events for a request offering the hosted web search, over
+// as many turns as its searches take: a call the model makes to it is
+// searched rather than passed on (serverTool, searched), and Kiro is asked
+// again with what was found, until it answers, calls a tool of the
+// caller's (passed on as ever, the searches of its turn with it), or has
+// taken hosted.uses + 2 turns (pause_turn, which the caller may send back
+// to go on). Searches past hosted.uses are max_uses_exceeded.
+async function* searching(creds, auth, req, model, budget, signal, hosted, first) {
+  let { res, a } = first
+  const messages = [...(req.messages ?? [])]
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reported: false, searches: 0 }
+  let refreshed = false
+  for (let turn = 1; ; turn++) {
+    const said = [] // this turn's blocks, for the next turn's history
+    const calls = [] // its searches
+    let client = false
+    let current = null
+    let stop = null
+    for await (const e of events(res.body, model, budget)) {
+      if (e.kind === "toolStart") {
+        current = e.name === SEARCH_NAME ? { args: "" } : null
+        if (current) calls.push(current)
+        else {
+          client = true
+          said.push({ type: "tool_use", id: e.id, name: e.name, input: "" })
+          yield e
+        }
+      } else if (e.kind === "toolArgs") {
+        if (current) current.args += e.text
+        else {
+          const b = said.at(-1)
+          if (b?.type === "tool_use") b.input += e.text
+          yield e
+        }
+      } else if (e.kind === "stop") stop = e
+      else {
+        if (e.kind === "text") {
+          const b = said.at(-1)
+          if (b?.type === "text") b.text += e.text
+          else said.push({ type: "text", text: e.text })
+        }
+        if (e.kind === "error") {
+          // in a turn after a search, a status, not a finished answer (reply)
+          yield turn > 1 ? { ...e, status: 502 } : e
+          return
+        }
+        yield e
+      }
+    }
+    if (signal?.aborted) throw aborted()
+    if (!stop) return
+    usage.input += stop.usage.input
+    usage.output += stop.usage.output
+    usage.cacheRead += stop.usage.cacheRead
+    usage.cacheWrite += stop.usage.cacheWrite
+    usage.reported ||= stop.usage.reported
+    for (const b of said)
+      if (b.type === "tool_use")
+        try {
+          b.input = b.input ? JSON.parse(b.input) : {}
+        } catch {
+          b.input = {}
+        }
+    if (!calls.length) {
+      yield { ...stop, usage }
+      return
+    }
+    for (const c of calls) {
+      const id = "srvtoolu_" + randomBytes(12).toString("hex")
+      let input = {}
+      try {
+        const v = c.args ? JSON.parse(c.args) : {}
+        if (v && typeof v === "object" && !Array.isArray(v)) input = v
+      } catch {}
+      // why the model searched (PURPOSE) is kiro-cli's, not Anthropic's: the
+      // caller sees the query alone, and only it is searched for
+      const { [PURPOSE]: _why, ...shown } = input
+      input = shown
+      yield { kind: "serverTool", id, name: SEARCH_NAME, input }
+      const query = typeof input.query === "string" ? input.query.trim() : ""
+      let found
+      if (!query) found = { code: "invalid_tool_input" }
+      else if (query.length > SEARCH_QUERY) found = { code: "query_too_long" }
+      else if (usage.searches >= hosted.uses) found = { code: "max_uses_exceeded" }
+      else {
+        usage.searches++
+        found = await webSearch(a, query, hosted, signal)
+        // a token Kiro turned down is refreshed once for the request, as a
+        // turn's is
+        if (found.status === 403 && !refreshed) {
+          refreshed = true
+          try {
+            a = await creds(auth, true)
+            found = await webSearch(a, query, hosted, signal)
+          } catch (e) {
+            if (e?.name === "AbortError" || signal?.aborted) throw e
+            found = { code: "unavailable", why: secretless(e?.message) }
+          }
+        }
+        if (found.status === 403) found = { code: "unavailable", why: "Kiro turned down the token for its web search (403)" }
+      }
+      const content = found.results ?? { type: "web_search_tool_result_error", error_code: found.code }
+      keepSearched(id, found.results ? found.text : searchFailedText(found.code) + (found.why ? ` (${found.why})` : ""))
+      yield { kind: "searched", id, content }
+      said.push({ type: "server_tool_use", id, name: SEARCH_NAME, input }, { type: "web_search_tool_result", tool_use_id: id, content })
+    }
+    if (signal?.aborted) throw aborted()
+    if (client) {
+      yield { kind: "stop", reason: "tool_use", usage }
+      return
+    }
+    if (turn >= hosted.uses + 2) {
+      yield { kind: "stop", reason: "pause_turn", usage }
+      return
+    }
+    messages.push({ role: "assistant", content: said })
+    const next = await ask(creds, auth, { ...req, messages }, model, budget, signal)
+    if (!next.res) {
+      yield { kind: "error", status: next.status, text: `Kiro, after its web search: ${next.message} (${next.status})` }
+      return
+    }
+    ;({ res, a } = next)
+  }
 }
 
 // ---- signing in ----------------------------------------------------------------------
@@ -1388,6 +1997,20 @@ async function signInPost(url, body) {
 
 const expiry = (s) => Date.now() + (s > 0 ? s : 3600) * 1000
 
+// what Kiro's page says of where to sign in at AWS, taken only in its shape:
+// the region goes into AWS's host names
+const AWS_REGION = /^[a-z]{2}(?:-[a-z]+)+-\d{1,2}$/
+// the ways Kiro's page comes back with a choice of
+const KIRO_WAYS = ["google", "github", "builderid", "awsidc", "internal", "external_idp"]
+function httpsURL(s) {
+  try {
+    const u = new URL(s)
+    return u.protocol === "https:" && !u.username && !u.password
+  } catch {
+    return false
+  }
+}
+
 // whoIs names a new sign-in with the email Kiro has for it, and its plan.
 async function whoIs(c) {
   try {
@@ -1412,8 +2035,21 @@ async function listen() {
   throw new Error("the ports Kiro's sign-in comes back to are all busy; close the Kiro IDE's sign-in and try again")
 }
 
+// signingIn ends the browser sign-in under way, if any, and frees its
+// port: magpie keeps one sign-in of a provider at a time, and one left
+// behind (a tab closed, a paste never made) kept its port till it timed
+// out, so a few of them left no port for the next
+let signingIn = null
+
 // browserSignIn is the IDE's: Kiro's sign-in page, back to a port here.
-async function browserSignIn() {
+async function browserSignIn(inputs = {}) {
+  const choice = inputs.loginMethod || "portal"
+  if (!["portal", "builderid", "enterprise"].includes(choice)) throw new Error("unknown Kiro sign-in method")
+  const issuer = choice === "enterprise" ? String(inputs.startUrl || "").trim() : BUILDER_ID_START
+  const region = String(inputs.region || "us-east-1").trim()
+  if (choice === "enterprise" && !httpsURL(issuer)) throw new Error("Enter the organization's HTTPS Start URL")
+  if (choice !== "portal" && !AWS_REGION.test(region)) throw new Error("Enter a valid AWS region")
+  signingIn?.()
   const { server, port } = await listen()
   const state = randomBytes(24).toString("base64url")
   const verifier = randomBytes(48).toString("base64url")
@@ -1429,7 +2065,39 @@ async function browserSignIn() {
     settle(result)
   }
 
+  // A sign-in comes back here once (Google, GitHub), or twice (Builder ID,
+  // Identity Center: Kiro's page, then AWS's). The browser may be on
+  // another computer (magpie on a server or in Docker): the address its
+  // tab ended on is pasted there, and magpie opens it here, on this port
+  // (magpie's pluginsignin_paste.go), following a 302 to AWS as the next
+  // page. So each stage answers only its own state, once, and a request
+  // that isn't this sign-in's is a 404, which magpie says is the wrong
+  // address at once instead of waiting.
+  let stage = "portal" // then "aws", then "over"
+  let busy = false // a code being traded: a second paste of it waits for the first
+  let onToAWS = "" // the page the portal stage sent the browser on to, said again to a repeat
+  let portalAsked = "" // what that stage was asked, so a repeat asking otherwise isn't taken
+  async function startAWS(opt, issuer, region) {
+    const reg = await signInPost(oidc(region) + "/client/register", { clientName: "Kiro IDE", clientType: "public", scopes: SCOPES,
+      grantTypes: ["authorization_code", "refresh_token"], redirectUris: ["http://127.0.0.1/oauth/callback"], issuerUrl: issuer })
+    if (stage === "over") throw new Error("this sign-in was cancelled")
+    if (!reg.clientId) throw new Error("AWS registered no client")
+    Object.assign(aws, { region, clientId: reg.clientId, clientSecret: reg.clientSecret,
+      provider: { builderid: "BuilderId", awsidc: "Enterprise", internal: "Internal" }[opt],
+      state: randomBytes(24).toString("base64url"), verifier: randomBytes(48).toString("base64url") })
+    const a = new URLSearchParams({ response_type: "code", client_id: aws.clientId, redirect_uri: awsRedirect, scopes: SCOPES.join(","),
+      state: aws.state, code_challenge: createHash("sha256").update(aws.verifier).digest("base64url"), code_challenge_method: "S256" })
+    onToAWS = `${oidc(region)}/authorize?${a}`
+    portalAsked = JSON.stringify([opt, issuer, region])
+    stage = "aws"
+    busy = false
+    return onToAWS
+  }
+
   server.on("request", async (req, res) => {
+    // each answer its own connection: none held open keeps the port once
+    // the sign-in is over
+    res.setHeader("Connection", "close")
     const url = new URL(req.url ?? "/", redirect)
     const html = (code, body) => {
       res.writeHead(code, { "Content-Type": "text/html; charset=utf-8" })
@@ -1437,57 +2105,88 @@ async function browserSignIn() {
     }
     if (url.pathname !== "/oauth/callback" && url.pathname !== "/signin/callback") return res.writeHead(404).end()
     const q = url.searchParams
-    if (!waiting) return html(200, page(false, "This sign-in is over", "Start it again."))
+    const over = () => html(404, page(false, "This sign-in is over", "Start it again."))
+    const notOurs = () => html(404, page(false, "This link isn't from this sign-in", "Paste the address of the tab this sign-in opened, or start it again."))
+    if (stage === "over") return over()
     const fail = (msg) => {
+      stage = "over"
       finish({ type: "failed", error: msg })
       html(200, page(false, "Sign-in didn't finish", msg))
     }
+    const got = q.get("state") ?? ""
+    const portal = got === state
+    const fromAWS = stage === "aws" && !!aws.state && got === aws.state
+    // a stale tab, another sign-in's, or a page that just sends a request
+    // here: it says nothing about this one, and can't end it
+    if (!portal && !fromAWS) return notOurs()
+    if (busy) return html(409, page(false, "Already finishing", "This sign-in is finishing with this address already."))
     if (q.get("error")) return fail(q.get("error_description") || q.get("error"))
     let c
     try {
-      if (aws.state && q.get("state") === aws.state) {
-        // back from AWS
+      if (fromAWS) {
+        // back from AWS, to the address it was sent with
+        if (url.pathname !== "/oauth/callback") return notOurs()
         if (!q.get("code")) return fail("AWS sent back no code")
+        busy = true
         const t = await signInPost(oidc(aws.region) + "/token", { clientId: aws.clientId, clientSecret: aws.clientSecret,
           grantType: "authorization_code", redirectUri: awsRedirect, code: q.get("code"), codeVerifier: aws.verifier })
         if (!t.accessToken) throw new Error("AWS sent back no token")
         c = { access: t.accessToken, refresh: t.refreshToken ?? "", expires: expiry(t.expiresIn), method: "idc", loginProvider: aws.provider,
           region: aws.region, clientId: aws.clientId, clientSecret: aws.clientSecret, profile: "", builderID: isBuilderID(aws.provider) }
-      } else if (q.get("state") !== state) {
-        // not ours: someone else's page, or a stale tab
-        return html(200, page(false, "This link isn't from this sign-in", "Start it again."))
       } else {
         const opt = q.get("login_option") ?? ""
+        const asked = JSON.stringify([opt, q.get("issuer_url"), q.get("idc_region")])
+        if (stage === "aws") {
+          // Kiro's page's address again (pasted twice, or reloaded): the
+          // same AWS page, not a second client and state, which would
+          // leave the first AWS tab's code refused
+          if (onToAWS && asked === portalAsked) {
+            res.writeHead(302, { Location: onToAWS })
+            return res.end()
+          }
+          // chosen again on Kiro's page (Back, then another way): that
+          // choice now, the AWS sign-in left behind dropped. Anything else
+          // with Kiro's page's state isn't a choice, and leaves AWS's going
+          if (!KIRO_WAYS.includes(opt)) return notOurs()
+          stage = "portal"
+          onToAWS = portalAsked = ""
+          for (const k of Object.keys(aws)) delete aws[k]
+        }
         if (opt === "google" || opt === "github") {
+          if (!q.get("code")) return fail("Kiro's page sent back no code")
+          busy = true
           const t = await signInPost(AUTH_SERVICE + "/oauth/token", { code: q.get("code"), code_verifier: verifier,
             redirect_uri: redirect + url.pathname + "?login_option=" + opt })
           if (!t.accessToken) throw new Error("Kiro sent back no token")
           c = { access: t.accessToken, refresh: t.refreshToken ?? "", expires: expiry(t.expiresIn), method: "social",
             loginProvider: opt === "google" ? "Google" : "Github", region: "us-east-1", profile: t.profileArn ?? "" }
         } else if (opt === "builderid" || opt === "awsidc" || opt === "internal") {
-          // on to AWS, with a client registered for this sign-in
+          // on to AWS, with a client registered for this sign-in. The region
+          // goes into AWS's host name, so it is only a region's shape
           const issuer = q.get("issuer_url")
           const region = q.get("idc_region")
           if (!issuer || !region) return fail("Kiro's page didn't say where to sign in at AWS")
-          const reg = await signInPost(oidc(region) + "/client/register", { clientName: "Kiro IDE", clientType: "public", scopes: SCOPES,
-            grantTypes: ["authorization_code", "refresh_token"], redirectUris: ["http://127.0.0.1/oauth/callback"], issuerUrl: issuer })
-          if (!reg.clientId) throw new Error("AWS registered no client")
-          Object.assign(aws, { region, clientId: reg.clientId, clientSecret: reg.clientSecret,
-            provider: { builderid: "BuilderId", awsidc: "Enterprise", internal: "Internal" }[opt],
-            state: randomBytes(24).toString("base64url"), verifier: randomBytes(48).toString("base64url") })
-          const a = new URLSearchParams({ response_type: "code", client_id: aws.clientId, redirect_uri: awsRedirect, scopes: SCOPES.join(","),
-            state: aws.state, code_challenge: createHash("sha256").update(aws.verifier).digest("base64url"), code_challenge_method: "S256" })
-          res.writeHead(302, { Location: `${oidc(region)}/authorize?${a}` })
+          if (!AWS_REGION.test(region)) return fail("Kiro's page named a region AWS doesn't have")
+          if (!httpsURL(issuer)) return fail("Kiro's page named an AWS sign-in that isn't an https address")
+          busy = true
+          await startAWS(opt, issuer, region)
+          res.writeHead(302, { Location: onToAWS })
           return res.end()
         } else if (opt === "external_idp") {
           return fail("A company's own identity provider can't be signed in to here yet; sign in with `kiro-cli login`, and use Kiro CLI's sign-in")
         } else return fail(`Kiro's page came back with a sign-in this plugin doesn't know (${JSON.stringify(opt)})`)
       }
     } catch (e) {
+      if (stage === "over") return over()
+      busy = false
       return fail(e.message)
     }
+    if (stage === "over") return over() // ended (a new sign-in, the time) while the code was traded
+    // still busy while it is named: a second paste is told it is finishing
     const who = await whoIs(c)
+    if (stage === "over") return over()
     const user = who.email ? nameOf(who.email, c.loginProvider) : "Kiro account"
+    stage = "over"
     finish({ type: "success", provider: ID, refresh: c.refresh, access: c.access, expires: c.expires, accountId: user,
       ...(uidOf(c.loginProvider) ? { uid: uidOf(c.loginProvider) } : {}),
       method: c.method, loginProvider: c.loginProvider, region: c.region, profileArn: who.profile,
@@ -1495,11 +2194,43 @@ async function browserSignIn() {
     html(200, page(true, "You're signed in", `${user} is signed in. You can close this tab.`))
   })
 
-  const timer = setTimeout(() => finish({ type: "failed", error: "the sign-in timed out" }), SIGN_IN_TIMEOUT)
+  const timer = setTimeout(() => {
+    stage = "over"
+    finish({ type: "failed", error: "the sign-in timed out" })
+  }, SIGN_IN_TIMEOUT)
+  const end = () => {
+    if (signingIn === superseded) signingIn = null
+    server.close()
+  }
+  // a new sign-in ends this one, or, over, frees its port at once
+  const superseded = () => {
+    stage = "over"
+    finish({ type: "failed", error: "another sign-in to Kiro was started" })
+    end()
+  }
+  signingIn?.() // one started while this one found its port
+  signingIn = superseded
   done.then(() => {
     clearTimeout(timer)
-    setTimeout(() => server.close(), 10_000).unref?.()
+    // a late address (pasted again, a tab reloaded) is told it is over a while
+    setTimeout(end, 10_000).unref?.()
   })
+  if (choice === "builderid" || choice === "enterprise") {
+    try {
+      const url = await startAWS(choice === "enterprise" ? "awsidc" : "builderid", issuer, region)
+      return {
+        url,
+        instructions: "Complete AWS sign-in. If magpie runs on another computer, paste the complete address of the final localhost page back here.",
+        method: "auto",
+        callback: () => done,
+      }
+    } catch (error) {
+      stage = "over"
+      finish({ type: "failed", error: error.message })
+      end()
+      throw error
+    }
+  }
   const challenge = createHash("sha256").update(verifier).digest("base64url")
   const q = new URLSearchParams({ state, code_challenge: challenge, code_challenge_method: "S256", redirect_uri: redirect, redirect_from: "KiroIDE" })
   return {
@@ -1573,8 +2304,10 @@ export async function KiroAuthPlugin({ client } = {}) {
           },
         }
       },
-      // the account's credits, as magpie's built-in showed them; a read,
-      // clean or failed, marked the built-in's account nothing
+      // the account's credits, as magpie's built-in showed them. A sign-in
+      // Kiro refused (gone) marks the account signed out, so magpie passes
+      // over it and its row offers Sign in again; a clean read takes the
+      // mark off, as after `kiro-cli login`. Any other failure keeps it.
       async usage(getAuth) {
         const auth = await getAuth()
         if (!(auth?.type === "api" && auth.key) && auth?.type !== "oauth") return { error: "not signed in", signIn: "kept" }
@@ -1582,13 +2315,25 @@ export async function KiroAuthPlugin({ client } = {}) {
           const u = usageOf(await usageLimits(await creds(auth), true))
           // named as the account is
           if (u.user && auth.type === "oauth" && !auth.source) u.user = nameOf(u.user, auth.loginProvider)
-          return { ...u, signIn: "kept" }
+          return { ...u, signIn: "renewed" }
         } catch (e) {
-          return { error: e.message, signIn: "kept" }
+          return { error: e.message, signIn: e.gone ? "expired" : "kept" }
         }
       },
       methods: [
-        { type: "oauth", label: "Kiro (Google, GitHub, AWS Builder ID, IAM Identity Center)", authorize: browserSignIn },
+        { type: "oauth", label: "Kiro (Google, GitHub, AWS Builder ID, IAM Identity Center)",
+          prompts: [{ type: "select", key: "loginMethod", message: "Choose a sign-in method", options: [
+            { label: "IAM Identity Center (organization Start URL)", value: "enterprise", hint: "Sign in to your organization with its AWS Start URL" },
+            { label: "AWS Builder ID", value: "builderid", hint: "Open AWS sign-in directly; one callback to paste on a remote server" },
+            { label: "Kiro sign-in page", value: "portal", hint: "Google, GitHub, IAM Identity Center or other Kiro sign-in methods" },
+          ] },
+          { type: "text", key: "startUrl", message: "Organization Start URL", placeholder: "https://d-xxxxxxxxxx.awsapps.com/start",
+            condition: (inputs) => inputs.loginMethod === "enterprise",
+            validate: (value) => httpsURL(String(value || "").trim()) ? undefined : "Enter an HTTPS Start URL" },
+          { type: "text", key: "region", message: "AWS region (blank uses us-east-1)", placeholder: "us-east-1",
+            condition: (inputs) => inputs.loginMethod === "enterprise",
+            validate: (value) => !value || AWS_REGION.test(value.trim()) ? undefined : "Enter a valid AWS region" },
+          ], authorize: browserSignIn },
         { type: "oauth", label: "Kiro CLI's or Kiro IDE's sign-in", authorize: ownSignIn },
         { type: "api", label: "Kiro API key (ksk_…)" },
       ],
@@ -1600,6 +2345,10 @@ export async function KiroAuthPlugin({ client } = {}) {
         name: "Kiro",
         npm: MESSAGES,
         api: BASE,
+        // magpie's own field (#2027): Kiro answers Anthropic's hosted web
+        // search itself (searching), so magpie passes a client's on as sent
+        // rather than searching for it. The user's own setting goes over it.
+        searches: true,
         ...was,
         models: { ...Object.fromEntries(MODELS.map((m) => [m.id, configModel(m)])), ...(was.models ?? {}) },
       }
@@ -1621,4 +2370,4 @@ export async function KiroAuthPlugin({ client } = {}) {
 }
 
 // for tests
-export const _internal = { generate, refresh, usageOf, buildKiro, events, reply, failure, toolID, toolName, toolNames, thinking, configModel, runtimeModel, readCLI, readIDE, regionOf, planName, frames }
+export const _internal = { generate, refresh, usageOf, buildKiro, kiroBody, IMAGE_LIMIT, events, reply, failure, toolID, toolName, toolNames, thinking, nativeFields, listModels, contextFirst, configModel, runtimeModel, readCLI, readIDE, regionOf, planName, frames }

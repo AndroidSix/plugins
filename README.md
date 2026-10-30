@@ -2,7 +2,7 @@
 
 [OpenCode](https://opencode.ai) provider plugins for coding-plan
 subscriptions, and [gateway middleware](#gateway-middleware),
-[routing strategies](#routing-strategies), [tools for every
+[gateway hooks](#gateway-hooks), [routing strategies](#routing-strategies), [tools for every
 agent](#tools-for-every-agent), [pages](#pages) and [agents](#agents) for
 magpie, maintained by the community. To make one, see
 [Write your own](#write-your-own). Each package signs in to one
@@ -11,15 +11,20 @@ subscription and makes its requests. The packages work in OpenCode and in
 
 | Package | Signs in to | Provider id |
 |---|---|---|
+| [catpaw](packages/catpaw) | Meituan's 妙手 CatPaw (ai.catpaw.meituan.com), with a browser web sign-in or the desktop client's saved credentials | `catpaw` |
 | [cline](packages/cline) | Cline (cline.bot): usage-billed models, ClinePass's and Cline's free ones, with Cline's device sign-in or an API key | `cline` |
 | [codearts](packages/codearts) | Huawei Cloud CodeArts (码道) coding plans (Trial, personal and enterprise credits), with Huawei Cloud OAuth sign-in (unofficial) | `codearts` |
 | [commandcode](packages/commandcode) | Command Code plans (Pro, GOAT, Max, Ultra, Go, Teams Pro) | `commandcode-plan` |
+| [copilot](packages/copilot) | GitHub Copilot on GitHub.com or GitHub Enterprise, with premium request or credit quotas | `github-copilot` |
 | [cursor](packages/cursor) | Cursor subscriptions (Pro, Pro+, Ultra, Teams), on the API cursor-agent talks to | `cursor` |
 | [devin](packages/devin) | Devin subscription (the devin CLI's account) | `devin` |
 | [factory](packages/factory) | Factory (Droid) subscription | `factory` |
+| [gcp-ai](packages/gcp-ai) | Google Cloud Vertex AI with your own gcloud / ADC login (needs `gcloud` and Chrome), plus the project's promotional credits | `gcp-ai` |
 | [grok](packages/grok) | Grok (SuperGrok / X Premium+), through the Grok Build CLI's sign-in | `grok` |
+| [joycode](packages/joycode) | JoyCode IDE credits with JD account browser sign-in, live models and credit multipliers (unofficial) | `joycode` |
 | [kimi-work](packages/kimi-work) | Ordinary Kimi desktop Work subscription, through the desktop app's local sign-in; separate from Kimi Code | `kimi-work` |
 | [kiro](packages/kiro) | Kiro (Free, Pro, Pro+, Power), with Kiro's sign-in, kiro-cli's or the IDE's, or an API key | `kiro` |
+| [loomy](packages/loomy) | iFlytek's Loomy (loomyad.xunfei.cn), with SMS sign-in | `loomy` |
 | [minimax](packages/minimax) | MiniMax Code (China): account credits and M Plan, with MiniMax Code's device sign-in | `minimax-code` |
 | [minimax](packages/minimax) | MiniMax Code (international): account credits and M Plan, with MiniMax Code's device sign-in | `minimax-code-global` |
 | [mimo](packages/mimo) | Xiaomi MiMo, with a Xiaomi account | `mimo-app` |
@@ -28,10 +33,11 @@ subscription and makes its requests. The packages work in OpenCode and in
 | [qoder](packages/qoder) | Qoder subscription (qoder.com), with Qoder's device sign-in | `qoder` |
 | [qoder](packages/qoder) | Qoder CN subscription (qoder.cn), with Qoder CN's device sign-in | `qoder-cn` |
 | [raccoon](packages/raccoon) | SenseTime Raccoon (商汤小浣熊, xiaohuanxiong.com): account credits and daily check-in, with browser sign-in or Raccoon desktop's sign-in | `raccoon` |
+| [river](packages/river) | River (river.ai) pay-as-you-go inference, with your API key: per-account models, documented reasoning efforts and live prices | `river` |
 | [trae](packages/trae) | Trae CN (trae.cn) and Trae international (trae.ai), free tier included, with Trae's browser sign-in (experimental) | `trae-cn`, `trae-global` |
 | [workbuddy](packages/workbuddy) | WorkBuddy (China build, CodeBuddy plan) | `workbuddy` |
 | [workbuddy](packages/workbuddy) | WorkBuddy (international build) | `workbuddy-ai` |
-| [zcode](packages/zcode) | ZCode: Z.ai / BigModel (智谱) GLM Coding Plan, team seats, Start Plan | `zcode` |
+| [zcode](packages/zcode) | ZCode: Z.ai / BigModel (智谱) GLM Coding Plan, team seats, Start Plan, daily claim of its gift plans | `zcode` |
 | [zed](packages/zed) | Zed (Pro, Pro Trial, Student, Business): Anthropic, OpenAI, Google and xAI models hosted by Zed | `zed` |
 | [zen-free](packages/zen-free) | OpenCode Zen free models with the public credential | `opencode-zen-free` |
 
@@ -48,6 +54,7 @@ These packages aren't OpenCode plugins. magpie runs them in its gateway, on the 
 | [think-tags](packages/think-tags) | Take `<think>…</think>` out of a reply's text, or put a Chat reply's `reasoning_content` into it (`thinking_to_content`) |
 | [antigravity-cloak](packages/antigravity-cloak) | Claude Code and Claude Desktop on Antigravity: break the words Antigravity turns their system prompt away for, in what Antigravity alone is sent |
 | [codex-history](packages/codex-history) | Opt-in Responses history compatibility after switching providers: remove historical ciphertext and optional item IDs while preserving readable content and tool-call pairing |
+| [history-trim](packages/history-trim) | Send a request's history smaller: fold a run of blank lines, drop a system prompt written twice and a message repeated right after itself, and cut a past tool result longer than `maxToolLength` at a word boundary |
 
 ```sh
 magpie plugin add @magpie-community/middleware-<name>
@@ -87,6 +94,7 @@ These give tools to every agent magpie connects. magpie serves them on its MCP s
 
 | Package | Tools |
 |---|---|
+| [search1api](packages/search1api) | Web search, news, agentic search, page retrieval, sitemaps and trends, with Search1API OAuth or an API key |
 | [calc](packages/calc) | `eval` exact arithmetic in fractions, `convert` units (data, time, length, mass, angle, temperature), `date` calendar date math across time zones and DST. No network, no key |
 
 ```sh
@@ -107,6 +115,11 @@ These add a page to magpie's window, in the app and in `magpie web`, under Plugi
 | Package | Page | Reads |
 |---|---|---|
 | [usage](packages/usage) | Usage glance: calls, errors, tokens and cost for today, 7 or 30 days, and the models behind them | `usage:summary` |
+| [powercontext](packages/powercontext) | Connection settings for an independently deployed PowerContext service | None |
+| [nowledge-mem](packages/nowledge-mem) | Connection settings, recall and capture switches, a real connection test, and the scope of what is sent | None |
+| [agent-office](packages/agent-office) | What are my agents doing: live sessions as workers in a voxel office (3D/2D) or a list, with status, current step and resume commands | no `magpie.read`; its host part reads the local session files of Claude Code, Codex, dsh, Gemini CLI, Qwen Code, Pi, omp, Qoder, WorkBuddy and CodeBuddy, including prompts, replies and tool commands (`text:false` keeps statuses and tool names only) |
+| [fingerprint](packages/fingerprint) | Numeric response fingerprints to investigate suspected model substitution across providers, with shared challenges, candidate rankings, local evidence and JSON export | none (its local service calls magpie’s gateway; sampling uses provider quota) |
+| [chat](packages/chat) | Chat with magpie's models, your MCP servers, instructions and skills, by Magic_zero ([Magiczerowxy](https://github.com/Magiczerowxy)). Has a host part: a local service the page goes to | none (its service calls magpie's gateway) |
 
 ```sh
 magpie plugin add @magpie-community/page-<name>
@@ -117,6 +130,57 @@ A page package is a folder under `packages/<name>/` with:
 - **`package.json`**: name `@magpie-community/page-<name>`, no `main`, and `"magpie": {"page": {"title", "file", "icon"}, "permissions": [...], "options": {…}}` ([the reference](https://usemagpie.ai/docs/plugins#pages)). `permissions` lists the reads the page makes, and magpie refuses any other. Declare only what it reads.
 - **the page**: HTML, CSS and scripts in files. It runs in a sandboxed frame with no network (`connect-src 'none'`) and no inline scripts. It talks to magpie only through `_magpie/bridge.js`: `magpie.ready`, `magpie.read(name, params)`, `magpie.options.get/set` (at most once a second), and `magpie.theme` with `onTheme`, whose `--magpie-*` variables it styles itself by.
 - a test that the page's scripts read only what `permissions` declares and reach no network, and of what it draws from a read.
+- optionally a host part: `main` with the OpenCode v1 form `export default {id, server}`, where `server(input, options)` starts a service on 127.0.0.1 that the page navigates its frame to. Such a service guards every route with a token only its own page gets, and checks `Host` ([chat](packages/chat) is the example).
+
+## Gateway hooks
+
+Like middleware, these run on the requests agents send, but in magpie's Bun host rather than on moejs, so one can wait on a service, keep state and import Node's built-ins. They require Magpie 0.1.1273 or newer and declare `magpie.hooks`.
+
+| Package | What it does |
+|---|---|
+| [powercontext](packages/powercontext) | [PowerContext](https://github.com/oceanbase/powercontext) recall and opt-in completed-conversation capture; no client MCP or skill required |
+| [nowledge-mem](packages/nowledge-mem) | [Nowledge Mem](https://mem.nowledge.co) recall, Context Bundle or Working Memory, per-harness provenance and opt-in conversation import as Mem Threads, automatic for every harness behind Magpie |
+
+Use the same plugin management commands as middleware:
+
+```sh
+magpie plugin add @magpie-community/gateway-powercontext
+magpie plugin add @magpie-community/gateway-nowledge-mem
+```
+
+Installed plugins use **Plugins › Installed › Options** and the normal on/off
+switch. Deploy PowerContext yourself using its
+[official installation walkthrough](https://powercontext.oceanbase.io/en/docs/get-started/quickstart/),
+then configure the Server URL and service key in the plugin's connection page
+or Options. The Scope ID is optional: without one, the service resolves the
+session/workspace binding or its default Scope. Use Magpie **0.1.1531 or newer**
+for page saves to reach hooks on the next request; earlier hook-capable versions
+need a Magpie restart after saving page options.
+No Server URL is assumed and capture defaults to off;
+remote/shared-key recall and capture each need a separate opt-in. The package calls an existing
+Server; it does not provision services or manage processes. See the
+[plugin README](packages/powercontext).
+
+Nowledge Mem needs no deployment of its own: the hook takes the endpoint and
+key from the plugin page, or from `NMEM_API_URL` and `NMEM_API_KEY` in Magpie's
+environment, and falls back to a local Mem at `http://127.0.0.1:14242`. Recall
+and the Context Bundle are on; importing conversations is off until enabled.
+Tools are Mem's own MCP server, added once in Library › MCP; the package adds
+no Library entry. Recall and saving include direct local requests and the
+sharing key Magpie writes into your own agents on this computer (`magpie-key`,
+Magpie 0.1.2210+); other gateway keys and remote requests stay out. **Test
+connection** checks the saved connection from a loopback helper; save changes
+first. Harness prompts and commands stay with the harnesses. See the
+[plugin README](packages/nowledge-mem).
+
+The asynchronous hook API shipped in Magpie 0.1.1273; see the
+[released host contract](https://github.com/yetone/magpie/blob/v0.1.1273/docs/subsystems/gateway-request-hooks.md).
+
+A gateway hook package is a folder under `packages/<name>/` with:
+
+- **`package.json`**: name `@magpie-community/gateway-<name>`, `"magpie": {"hooks": "./<name>.hooks.mjs", "options": {…}}`, no `main`.
+- **`<name>.hooks.mjs`**: exports async `onRequest(body, ctx)` to add context. Optional `onResponse(reply, ctx)` observes a completed reply through a bounded, best-effort notification. The hooks share request-local `ctx.state`. Client tool declarations and execution loops remain client-owned.
+- tests that call the hooks the way the gateway does, with any service they talk to faked.
 
 ## Agents
 
@@ -128,9 +192,12 @@ it off puts the config back.
 | Package | Agent |
 |---|---|
 | [aider](packages/aider) | [Aider](https://aider.chat): `~/.aider.conf.yml`, through litellm's `openai/` prefix |
-| [pig](packages/pig) | [PiG](https://github.com/MichaelKinsy/PiG): injects Magpie's endpoint and model catalog into `~/.pig/agent/models.json`; choose the model in PiG, startup settings stay unchanged |
+| [bub](packages/bub) | [Bub](https://bub.build): `~/.bub/config.yml`, as the `magpie:` provider (needs Bub 0.5.1 or later) |
+| [kilo](packages/kilo) | [Kilo Code](https://kilo.ai): `~/.config/kilo/kilo.jsonc`, through an OpenAI-compatible provider |
 | [kimi-desktop](packages/kimi-desktop) | Ordinary [Kimi desktop](https://www.kimi.com/) Work, through its authenticated local runtime; not Kimi Code CLI |
+| [pig](packages/pig) | [PiG](https://github.com/MichaelKinsy/PiG): injects Magpie's endpoint and model catalog into `~/.pig/agent/models.json`; choose the model in PiG, startup settings stay unchanged |
 | [type4me](packages/type4me) | [Type4Me](https://github.com/joewongjc/type4me), macOS voice input: `~/Library/Application Support/Type4Me/magpie-agent.json`, for its LLM post-processing |
+| [opencodereview](packages/opencodereview) | [Open Code Review](https://github.com/alibaba/open-code-review) (`ocr`): `~/.opencodereview/config.json` as a custom Anthropic provider, so `ocr review` / `ocr scan` run on magpie's models |
 
 ```sh
 magpie plugin add @magpie-community/agent-<name>
@@ -148,11 +215,13 @@ Agent skills for magpie users, in `skills/<name>/SKILL.md`.
 
 | Skill | What it does |
 |---|---|
+| [magpie-setup](skills/magpie-setup) | Lets an agent set magpie up as the user asks, through its own `magpie` commands: keys and subscriptions, an agent's model, routing groups with fallbacks and time-of-day rules, gateway keys with budgets, and MCP servers and instructions shared with every agent |
 | [magpie-quota](skills/magpie-quota) | Lets an agent check what is left of every subscription, coding plan and key balance magpie has (`magpie quota --json`), and wait for allowance to come back |
 
-In magpie, it is first under Library › Market › Skills. Elsewhere:
+In magpie, they are first under Library › Market › Skills. Elsewhere:
 
 ```sh
+npx skills add magpie-community/plugins --skill magpie-setup
 npx skills add magpie-community/plugins --skill magpie-quota
 ```
 
@@ -207,10 +276,12 @@ Each package is a folder under `packages/<name>/`:
     `checkin(getAuth, provider)`. magpie calls it once a day for each
     signed-in account while the user has it on (Settings → Usage →
     Plugins), and shows what came of it on the account's Usage card. It
-    returns `{ outcome, credit?, streak?, message? }`, `outcome` being
+    returns `{ outcome, credit?, streak?, message?, until? }`, `outcome` being
     `claimed` (checked in now), `done` (already today), `ineligible`,
     `inactive` (no check-in event now), `captcha` or `failed`; a throw is
     `failed` with its message, and only `failed` is tried again that day.
+    `until` (RFC 3339) is when the vendor's own day turns, if not at
+    Beijing midnight: magpie asks again then (Qoder's opens at 10:00 UTC+8).
     Never solve a captcha: return `captcha` and the user checks in in the
     vendor's app. Needs magpie with the hook (after v0.1.1083);
     [the contract](https://github.com/yetone/magpie/blob/main/docs/subsystems/provider-plugins.md#a-plugins-daily-check-in).

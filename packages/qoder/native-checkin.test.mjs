@@ -80,9 +80,26 @@ test("an already-claimed campaign is done without another claim", async () => {
   expect(p.seen.map((x) => x.path)).toEqual(["/sash/api/v1/me/campaigns"])
 })
 
-test("no benefit campaign is inactive", async () => {
+// plugins#304 (ReneXiong): the identity was read and sent, and the list
+// still had no CLAIM_BENEFIT. Qoder decides that per device, so the answer
+// says it was this device's identity that was offered nothing, and that
+// Qoder desktop can still claim it, instead of a bare "inactive".
+test("no benefit campaign is inactive, saying this device's identity was offered none", async () => {
   const p = await checkin(QoderAuthPlugin, () => json({ campaigns: [{ campaignId: "x", actionType: "VIEW_DETAILS", claimStatus: "CLAIMABLE" }] }))
-  expect(p.out).toEqual({ outcome: "inactive" })
+  expect(p.out.outcome).toBe("inactive")
+  expect(p.out.message).toContain("Qoder offered this device's identity")
+  expect(p.out.message).toContain("no daily credits campaign")
+  expect(p.out.message).toContain("claim them there")
+  expect(p.out.message).toContain("Qoder desktop")
+  expect(reads).toHaveLength(1)
+})
+
+test("CN offered nothing with Qoder CN's own identity is inactive, naming Qoder CN", async () => {
+  const p = await checkin(QoderCNAuthPlugin, () => json({ campaigns: [] }), "https://openapi.qoder.com.cn")
+  expect(p.out.outcome).toBe("inactive")
+  expect(p.out.message).toContain("Qoder CN offered this device's identity")
+  expect(p.out.message).toContain("Qoder CN desktop")
+  expect(reads).toHaveLength(1)
 })
 
 test("a claim answer with nested data is read", async () => {
@@ -191,15 +208,15 @@ test("yesterday's claimed entry does not hide today's claimable campaign", async
     { campaignId: "new", actionType: "CLAIM_BENEFIT", claimStatus: "CLAIMABLE", startAt: Math.floor(Date.now()/1000)-100, endAt: Math.floor(Date.now()/1000)+86000, benefit: { amount: 100 } },
   ] }
   const p = await checkin(QoderAuthPlugin, (u) => u.pathname.endsWith("/claim") ? json({ status: "CLAIMED", benefit: { amount: 125 } }) : json(list))
-  expect(p.out).toEqual({ outcome: "claimed", credit: 125 })
+  expect(p.out).toMatchObject({ outcome: "claimed", credit: 125 })
 })
 
 test("an active claimed campaign is done, and an unavailable one retries", async () => {
   const active = { campaignId: "c", actionType: "CLAIM_BENEFIT", claimStatus: "CLAIMED", startAt: Math.floor(Date.now()/1000)-100, endAt: Math.floor(Date.now()/1000)+1000, benefit: { amount: 100 } }
   let p = await checkin(QoderAuthPlugin, () => json({ campaigns: [active] }))
-  expect(p.out).toEqual({ outcome: "done", credit: 100 })
+  expect(p.out).toMatchObject({ outcome: "done", credit: 100 })
   p = await checkin(QoderAuthPlugin, () => json({ campaigns: [{ ...active, claimStatus: "DISABLED" }] }))
-  expect(p.out).toEqual({ outcome: "failed", message: "campaigns: today's credits aren't offered yet" })
+  expect(p.out).toMatchObject({ outcome: "failed", message: "campaigns: today's credits aren't offered yet" })
 })
 
 test("a refused device token is rotated and the claim asked again", async () => {

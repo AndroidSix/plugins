@@ -4,12 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import {_internal as I} from './index.mjs';
 
-const session = {uid: 'synthetic-account', workToken: 'synthetic-work-token', webToken: 'synthetic-web-token'};
-const auth = {source: 'kimi-work-desktop', uid: session.uid};
+const session = {uid: 'synthetic-account', workToken: 'synthetic-work-token', webToken: 'synthetic-web-token', webRefresh:'synthetic-refresh-token'};
+const auth = {source: 'kimi-work-desktop', uid: session.uid,access:session.webToken,refresh:session.webRefresh,expires:0};
 const models = {data: [{id: 'k3-agent', display_name: 'K3', context_length: 1000000,
   supports_image_in: true, supports_reasoning: true, reasoningEffortOptions: [{effort: 'REASONING_EFFORT_LOW'}, {effort: 'REASONING_EFFORT_MAX'}]}]};
 
-test('sign-in saves an account reference and dynamic models/usage retain Work accounting', async () => {
+test('sign-in imports web renewal credentials and dynamic models/usage retain Work accounting', async () => {
   const calls = [];
   const p = I.createPlugin({readSession: () => session, fetchImpl: async (url, init) => {
     calls.push({url, init});
@@ -18,10 +18,11 @@ test('sign-in saves an account reference and dynamic models/usage retain Work ac
   const result = await (await p.auth.methods[0].authorize()).callback();
   expect(result).toMatchObject({type: 'success', source: auth.source, uid: auth.uid});
   expect(JSON.stringify(result)).not.toContain(session.workToken);
+  expect(result).toMatchObject({access:session.webToken,refresh:session.webRefresh});
   const catalog = await p.provider.models({models: {}}, {auth});
   expect(catalog['k3-agent'].limit.context).toBe(262144);
   expect(Object.keys(catalog['k3-agent'].variants)).toEqual(['low', 'max']);
-  expect((await p.auth.usage(async () => auth)).windows).toEqual([{name: '会员共享额度', used: 42}]);
+  expect((await p.auth.usage(async () => auth)).windows).toEqual([{name: '本月', used: 42}]);
   expect(calls.at(-1).init.headers.Authorization).toBe('Bearer ' + session.webToken);
 });
 
@@ -116,4 +117,33 @@ test('the Work token goes only to the official Work chat endpoint', async () => 
   }
   await expect(loader.fetch(I.BASE + '/chat/completions', {method: 'GET'})).rejects.toThrow('仅接受官方');
   expect(called).toBe(0);
+});
+
+// #465 (kongbai01203): Kimi answered a spent account with a 403, which magpie
+// took for a key fault and kept routing to. The words are the reporter's own
+// (usage.jsonl and `magpie provider test kimi-work`); the issue doesn't show
+// the JSON around them, so both an OpenAI-style and a Connect-style body are
+// tried.
+for (const body of [
+  JSON.stringify({error: {message: "You've reached your usage limit for this billing cycle.", type: 'permission_denied_error'}}),
+  JSON.stringify({code: 'resource_exhausted', message: 'insufficient balance'}),
+  JSON.stringify({error: {code: 'resource_exhausted', message: 'insufficient balance'}}),
+]) test('a spent allowance\'s 403 goes out as a 429 with Kimi\'s words: ' + body, async () => {
+  const p = I.createPlugin({readSession: () => session, fetchImpl: async () => new Response(body,
+    {status: 403, headers: {'Content-Type': 'application/json', 'Retry-After': '3600'}})});
+  const loader = await p.auth.loader(async () => auth);
+  const response = await loader.fetch(I.BASE + '/chat/completions', {method: 'POST', body: '{}'});
+  expect(response.status).toBe(429);
+  expect(response.headers.get('retry-after')).toBe('3600');
+  expect(response.headers.get('content-type')).toBe('application/json');
+  expect(await response.text()).toBe(body);
+});
+
+test('a 403 that is not about the allowance stays a 403', async () => {
+  const body = JSON.stringify({error: {message: 'Access denied for this model', type: 'permission_denied_error'}});
+  const p = I.createPlugin({readSession: () => session, fetchImpl: async () => new Response(body, {status: 403})});
+  const loader = await p.auth.loader(async () => auth);
+  const response = await loader.fetch(I.BASE + '/chat/completions', {method: 'POST', body: '{}'});
+  expect(response.status).toBe(403);
+  expect(await response.text()).toBe(body);
 });

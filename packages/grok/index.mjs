@@ -19,6 +19,7 @@ const BASE = "https://cli-chat-proxy.grok.com/v1"
 const CLIENT_VERSION = "1.0.41"
 const CPA_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 const CPA_SCOPE = `https://auth.x.ai::${CPA_CLIENT_ID}`
+const LOOP_CHECKS = [["x-grok-doom-loop-check", "1024"], ["x-grok-exact-repetition-check", "64"]]
 const REFRESH_MARGIN = 5 * 60 * 1000 // a token this close to its end is renewed before a request
 const LEAD_MS = REFRESH_MARGIN // and this close, magpie renews it ahead of time (auth.refresh)
 const LINK_WAIT = 30 * 1000
@@ -394,6 +395,10 @@ function foldRoot(root, ps, depth) {
   return out
 }
 
+// what Codex asks an OpenAI provider for with output token replay on
+// (codex-rs/core/src/client.rs)
+const OUTPUT_REPLAY = "output.encrypted_content"
+
 const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v)
 
 // rewrite leaves out what Grok's backend doesn't take: tools of other
@@ -406,9 +411,13 @@ const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v)
 // encrypted reasoning. A function's parameters with a union at the root
 // (Codex desktop's codex_app automation_update) are folded to an object,
 // which Grok turns away otherwise: "tool parameter root must be an object
-// type" (magpie#1271).
+// type" (magpie#1271). Codex's output token replay asks for each message's
+// own sealed copy ("output.encrypted_content" in include), which Grok turns
+// away: 'Argument not supported: "output.encrypted_content" in "include"
+// field' (#524). Only that value goes; reasoning.encrypted_content and the
+// tool-output values xAI documents stay.
 function rewrite(body, xSearch = false) {
-  if (typeof body !== "string" || (!xSearch && !body.includes('"tools"') && !body.includes('"tool_choice"') && !body.includes('"reasoning"') && !body.includes('"agent_message"'))) return body
+  if (typeof body !== "string" || (!xSearch && !body.includes('"tools"') && !body.includes('"tool_choice"') && !body.includes('"reasoning"') && !body.includes('"agent_message"') && !body.includes(`"${OUTPUT_REPLAY}"`))) return body
   let m
   try {
     m = JSON.parse(body)
@@ -473,6 +482,11 @@ function rewrite(body, xSearch = false) {
       return { type: "message", role: "user", content: header
         ? [{ type: "input_text", text: `${header}\n\n` }, ...it.content] : it.content }
     })
+  }
+  if (Array.isArray(m.include) && m.include.includes(OUTPUT_REPLAY)) {
+    m.include = m.include.filter((v) => v !== OUTPUT_REPLAY)
+    if (!m.include.length) delete m.include
+    dirty = true
   }
   for (const it of Array.isArray(m.input) ? m.input : []) {
     if (it && it.type === "reasoning" && "content" in it && it.content === null) {
@@ -987,6 +1001,15 @@ export const GrokAuthPlugin = async ({ client, magpie }) => {
             }
             if (asked.window) headers.set("x-grok-context-window", String(asked.window))
             if (typeof parsed.prompt_cache_key === "string" && parsed.prompt_cache_key) headers.set("x-grok-conv-id", parsed.prompt_cache_key)
+            // Grok Build asks the proxy to watch every Responses stream for a
+            // model stuck repeating itself: without these the proxy cuts a
+            // loop only after ~4K tokens, and a looser one (a fence or a line
+            // over and over) runs to max_output_tokens (yetone/magpie#3594).
+            // The values are Grok Build 1.0.67's (doom_loop_recovery's
+            // max_threshold is the 64).
+            if (new URL(req.url).pathname.endsWith("/responses")) {
+              for (const [k, v] of LOOP_CHECKS) if (!headers.has(k)) headers.set(k, v)
+            }
             headers.delete("content-length")
             const send = async (key) => {
               await sign(headers, key)

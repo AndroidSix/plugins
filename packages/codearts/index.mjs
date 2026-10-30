@@ -42,6 +42,7 @@
 // replaces its browser sign-in + bearer-token requests with CodeArts' OAuth +
 // signed-request flow. See README.md.
 
+import { createHash, createHmac } from "node:crypto"
 import { createServer } from "node:http"
 import fs from "node:fs"
 import os from "node:os"
@@ -66,6 +67,23 @@ const OPENGW_GATEWAY_CONFIG_URL = `${OPENGW_HOST}/api/v1/gateway/config`
 // two the plugin itself calls, by name. STS takes the refresh token, never a
 // signature, and the portal only ever opens in the browser.
 const SIGNED_HOSTS = new Set([SNAP_HOST, OPENGW_HOST].map((u) => new URL(u).host))
+
+// Huawei Cloud IAM: the one place an account's own phone number can be read
+// with the credentials a sign-in already carries (`GET /v3.0/OS-USER/users/
+// {principal_id}` answers `user.phone`, measured `0086-13800138000`).
+//
+// Deliberately NOT in SIGNED_HOSTS. magpie forwards requests through this
+// plugin's `fetch`, and that set is the fence around the account's temporary
+// credentials; adding IAM to it would let an `api` override carry them to
+// another service. The plugin's own GET is signed here, by this one function,
+// for this one URL — nothing forwarded ever reaches IAM signed.
+const IAM_HOST = "https://iam.cn-north-4.myhuaweicloud.com"
+const IAM_USER_URL = (userId) => `${IAM_HOST}/v3.0/OS-USER/users/${encodeURIComponent(userId)}`
+const IAM_TIMEOUT_MS = 8_000
+// The phone never changes for one IAM user, and the card asks often: one read
+// per account is enough, kept in memory for IAM_PHONE_TTL_MS (a failed read
+// included, so a card refresh does not ask IAM again every time).
+const IAM_PHONE_TTL_MS = 6 * 60 * 60 * 1000
 // The daily free token pool a `maas_type: benefit` chat draws on (never the
 // credit packages), so a free model's spend shows up in the usage panel.
 const BENEFIT_BALANCE_URL = `${OPENGW_HOST}/api/v1/user/tokens/balance`
@@ -156,6 +174,8 @@ const SESSION_HEADER = "x-ot-session-id"
 // sends the request again, and DELETEs it when it gives up.
 const TRACE_QUEUE_URL = (traceId) => `${SNAP_HOST}/api/v1/concurrency/trace-queues/${encodeURIComponent(traceId)}`
 const QUEUE_BUDGET_MS = 300_000
+/** magpie's: "1" when another candidate follows this request. */
+const FALLBACK_HEADER = "x-magpie-fallback"
 // Every chat of an account goes out under its one session id, so this gate is
 // what keeps the account within the vendor's 3 sessions: an option may only
 // lower it.
@@ -217,6 +237,14 @@ const CATALOG = [
   { id: "deepseek-v4-pro-0813", name: "DeepSeek V4 Pro" },
   { id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash" },
 ]
+
+// Every model listed takes text alone: the vision ones (`-vl`) are left out
+// (parseModelInfo), and the rest answer an image with
+// `InferHub.001001020.406` "The request model is not multimodal". Said in so
+// many words (`image: false`, not left out, which magpie reads as unknown),
+// so magpie describes an image for the model or leaves it out, and an agent
+// is told it takes none.
+const TEXT_ONLY = { input: { text: true, image: false, audio: false, video: false, pdf: false } }
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -471,23 +499,148 @@ function b64Json(s) {
   }
 }
 
+/** The signer's claims from the refresh token's `user_profile`, or null. */
+function profileOf(cred) {
+  const token = typeof cred?.refresh_token === "string" ? cred.refresh_token : ""
+  const parts = token.split(".")
+  if (parts.length !== 3) return null
+  const payload = b64Json(parts[1])
+  const raw = payload?.user_profile
+  return typeof raw === "string" ? (safeJson(raw) ?? b64Json(raw)) : asRecord(raw)
+}
+
 /**
  * Who signed in. STS answers with no user fields, so without this every
  * sign-in looked like a new account to magpie (one more `codearts#xxxxxx`);
  * the refresh_token is a JWT whose `user_profile` claim names the signer.
  * `id` tells accounts apart, `name` is what the usage card shows.
+ *
+ * The claim carries no phone number, only IAM's `account_name` (the `hw…`
+ * string) and `principal_urn` — which is why the card used to show
+ * `iam::<domain>:user:<name>`, an ID nobody can tell apart from another
+ * account's. `user_phone` (read from IAM after sign-in, see
+ * `fetchAccountPhone`) stands in front of them when it is there.
+ *
+ * `id` is the identity (the URN) and keeps every IAM shape; `name` is only
+ * what a person can read. When the claim carries no such value, `name` is
+ * empty and the host falls back to the provider's name — an IAM id is never
+ * the name (the `accountId` / `uid` rule in magpie-plugin-scaffold, #27).
  */
 function accountIdentityOf(cred) {
   const legacy = { id: firstOf(cred?.user_name, cred?.user_id), name: firstOf(cred?.user_name) }
-  const token = typeof cred?.refresh_token === "string" ? cred.refresh_token : ""
-  const parts = token.split(".")
-  if (parts.length !== 3) return legacy
-  const payload = b64Json(parts[1])
-  const raw = payload?.user_profile
-  const profile = typeof raw === "string" ? (safeJson(raw) ?? b64Json(raw)) : asRecord(raw)
-  const id = firstOf(profile?.principal_urn, profile?.account_name, profile?.account_id, profile?.user_id, legacy.id)
-  const name = firstOf(profile?.user_name, profile?.account_name, profile?.domain_name, legacy.name)
+  const profile = profileOf(cred)
+  if (!profile) return { ...legacy, name: displayNameOf(cred?.user_phone, legacy.name) }
+  const id = firstOf(profile.principal_urn, profile.account_name, profile.account_id, profile.user_id, legacy.id)
+  const name = displayNameOf(cred?.user_phone, profile.user_name, profile.account_name, profile.domain_name, legacy.name)
   return { id, name }
+}
+
+// What IAM writes in place of a name: `iam::<domain>:user:<name>`, a `urn:…`,
+// the bare 32-character domain id, the account's `hw…` name, or a uuid. The
+// shapes are read as IDs wherever they appear; none of them is a name.
+const IDENTIFIER_PATTERNS = [
+  /::/, // iam::<domain>:user:<name> / arn:…
+  /^urn:/i, // urn:…
+  /^hw[0-9a-f]{6,}$/i, // Huawei IAM account name, e.g. hw123456789012345
+  /^[0-9a-f]{8}-[0-9a-f]{4}-/i, // uuid
+  /^[0-9a-f]{16,}$/i, // bare hash, incl. the 32-character domain id
+]
+
+/** Does this value look like an internal ID rather than a display name? */
+function looksLikeIdentifier(value) {
+  const s = String(value ?? "").trim()
+  return !!s && IDENTIFIER_PATTERNS.some((re) => re.test(s))
+}
+
+/** The first candidate that a person can tell apart from another account. */
+function displayNameOf(...candidates) {
+  for (const candidate of candidates) {
+    const name = firstOf(candidate)
+    if (name && !looksLikeIdentifier(name)) return name
+  }
+  return ""
+}
+
+/**
+ * A phone number as the cards show it: `0086-13800138000` → `138****8000`.
+ * The area code Huawei answers with is dropped, and any number too short to
+ * mask is not a name worth showing (empty, so the caller falls back).
+ */
+function maskPhone(raw) {
+  let digits = String(raw ?? "").replace(/\D/g, "")
+  // Huawei Cloud writes the country code as `0086-…`; a person's own number
+  // may come as `+86 …`. Either is dropped when an 11-digit number follows.
+  if (digits.length > 11 && digits.startsWith("0086")) digits = digits.slice(4)
+  else if (digits.length > 11 && digits.startsWith("86")) digits = digits.slice(2)
+  // a phone is 11 digits; a shorter run is not a number to mask
+  if (digits.length < 11) return ""
+  return `${digits.slice(0, 3)}****${digits.slice(-4)}`
+}
+
+// One phone read per IAM user, re-read after IAM_PHONE_TTL_MS. A failed read
+// is cached too (an empty answer): without that, a card refresh asks IAM again
+// every time, each able to wait the full timeout. Stale entries are dropped
+// past a cap, so the map does not grow for the life of the host.
+const IAM_PHONE_CAP = 1024
+const phoneByIamUser = new Map()
+
+function rememberPhone(iamUserId, phone) {
+  if (phoneByIamUser.size >= IAM_PHONE_CAP) {
+    for (const [k, v] of phoneByIamUser) if (Date.now() - v.at >= IAM_PHONE_TTL_MS) phoneByIamUser.delete(k)
+    if (phoneByIamUser.size >= IAM_PHONE_CAP * 2) phoneByIamUser.clear()
+  }
+  phoneByIamUser.set(iamUserId, { at: Date.now(), phone })
+}
+
+/**
+ * The account's own phone number, read from Huawei Cloud IAM with the
+ * credentials the sign-in already holds. Best effort: `""` when the claim has
+ * no `principal_id`, the call fails, or the answer carries no usable number —
+ * a display name must never cost anyone a sign-in.
+ */
+async function fetchAccountPhone(cred, fetcher = globalThis.fetch) {
+  const iamUserId = firstOf(profileOf(cred)?.principal_id, profileOf(cred)?.user_id)
+  if (!iamUserId || !cred?.access_key_id || !cred?.security_token) return ""
+  const hit = phoneByIamUser.get(iamUserId)
+  if (hit && Date.now() - hit.at < IAM_PHONE_TTL_MS) return hit.phone
+  try {
+    const url = IAM_USER_URL(iamUserId)
+    const signed = await signRequestHuawei(
+      cred.access_key_id, cred.secret_access_key, cred.security_token,
+      "GET", url, new Uint8Array(),
+    )
+    const headers = new Headers()
+    signed.forEach((value, key) => {
+      if (key !== "host") headers.set(key, value)
+    })
+    const res = await fetcher(url, {
+      method: "GET",
+      headers,
+      redirect: "error",
+      signal: AbortSignal.timeout(IAM_TIMEOUT_MS),
+    })
+    if (!res.ok) {
+      rememberPhone(iamUserId, "")
+      return ""
+    }
+    const body = await res.json().catch(() => null)
+    const phone = maskPhone(body?.user?.phone)
+    rememberPhone(iamUserId, phone)
+    return phone
+  } catch {
+    rememberPhone(iamUserId, "")
+    return ""
+  }
+}
+
+/** `{ user_phone }` when the account has one to show, else `{}` (never throws). */
+async function accountPhoneField(cred, fetcher) {
+  try {
+    const phone = await fetchAccountPhone(cred, fetcher)
+    return phone ? { user_phone: phone } : {}
+  } catch {
+    return {}
+  }
 }
 
 /** The credential a sign-in carries; magpie keeps it in the `access` field. */
@@ -496,7 +649,10 @@ function credentialOf(auth) {
   const raw = typeof auth.access === "string" ? auth.access : ""
   if (!raw) return null
   const cred = safeJson(raw)
-  return cred && typeof cred.access_key_id === "string" && cred.access_key_id ? cred : null
+  if (!cred || typeof cred.access_key_id !== "string" || !cred.access_key_id) return null
+  // Which OAuth client a refresh token may be spent at. A record read here is
+  // one this package's CodeArts sign-in wrote, whatever an older one lacks.
+  return { ...cred, oauth_client: firstOf(cred.oauth_client, "codearts-agent") }
 }
 
 function expiresFromCredential(cred) {
@@ -507,8 +663,8 @@ function expiresFromCredential(cred) {
   return Date.now() + 86_400_000
 }
 
-/** POST the STS token endpoint with a DPoP proof. */
-async function requestToken(body, keyPair, fetcher) {
+/** POST the STS token endpoint with a DPoP proof; `label` is the card that asked. */
+async function requestToken(body, keyPair, fetcher, label = "CodeArts") {
   const dpop = await signDpopJws(keyPair, "POST", STS_TOKEN_ENDPOINT)
   let response
   try {
@@ -521,7 +677,7 @@ async function requestToken(body, keyPair, fetcher) {
       signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
     })
   } catch (e) {
-    throw new Error(`CodeArts token request network error: ${String(e)}`)
+    throw new Error(`${label} token request network error: ${String(e)}`)
   }
   let data = null
   try {
@@ -530,7 +686,7 @@ async function requestToken(body, keyPair, fetcher) {
     data = null
   }
   if (!response.ok || !data?.credentials) {
-    const message = `CodeArts token request failed: ${response.status}${data ? ` ${JSON.stringify(data)}` : ""}`
+    const message = `${label} token request failed: ${response.status}${data ? ` ${JSON.stringify(data)}` : ""}`
     // Only refresh_token invalidation is terminal; a transient DPoP rejection
     // must not permanently mark the account.
     if (data?.error === "invalid_grant" || isDeadRefreshToken(message)) {
@@ -552,14 +708,14 @@ function isDeadRefreshToken(text) {
 
 const isPermanentRefreshFailure = (e) => e?.signIn === "expired" || isDeadRefreshToken(e?.message ?? e)
 
-function exchangeAuthorizationCode(code, codeVerifier, port, keyPair, fetcher) {
+function exchangeAuthorizationCode(code, codeVerifier, port, keyPair, fetcher, label = "CodeArts") {
   return requestToken({
     client_id: CLIENT_ID,
     code,
     code_verifier: codeVerifier,
     grant_type: GRANT_AUTHORIZATION_CODE,
     redirect_uri: `http://127.0.0.1:${port}${REDIRECT_PATH}`,
-  }, keyPair, fetcher)
+  }, keyPair, fetcher, label)
 }
 
 function exchangeRefreshToken(refreshToken, codeVerifier, keyPair, fetcher) {
@@ -627,7 +783,7 @@ const buildPortalLoginResultUrl = (ok) =>
  * the sign-in at once, with the portal's own words when it gave any. The
  * redirect target is always that page, never a parameter of the request.
  */
-function startOAuthCallbackServer(pkce, keyPair, fetcher) {
+function startOAuthCallbackServer(pkce, keyPair, fetcher, label = "CodeArts") {
   let resolveResult
   let rejectResult
   const result = new Promise((resolve, reject) => {
@@ -663,7 +819,7 @@ function startOAuthCallbackServer(pkce, keyPair, fetcher) {
       return
     }
     const port = request.socket.localPort ?? 0
-    void exchangeAuthorizationCode(code, pkce.codeVerifier, port, keyPair, fetcher).then(
+    void exchangeAuthorizationCode(code, pkce.codeVerifier, port, keyPair, fetcher, label).then(
       (token) => {
         response.writeHead(307, { Location: buildPortalLoginResultUrl(true) }).end()
         const cred = credentialFromTokenResponse(token, pkce.codeVerifier, keyPair)
@@ -715,10 +871,10 @@ function listenOnCallbackPort(server) {
  * The result resolves once the browser is redirected back and STS answers;
  * the callback server is closed as soon as the result settles.
  */
-async function startOAuthFlow(fetcher) {
+async function startOAuthFlow(fetcher, label = "CodeArts") {
   const pkce = await generatePkcePair()
   const keyPair = await generateDpopKeyPair()
-  const { port, server, result } = await startOAuthCallbackServer(pkce, keyPair, fetcher)
+  const { port, server, result } = await startOAuthCallbackServer(pkce, keyPair, fetcher, label)
   // The authorize URL carries a ticket_id as the IDE's does; the code flow
   // itself never reads it back.
   const loginUrl = buildOAuthLoginUrl(port, pkce, randomHex(32))
@@ -800,12 +956,15 @@ function isRegularModel(model, state) {
  * - the output budget inside the gateway's 65536;
  * - always `stream: true`. CodeArts meters only streamed answers — a
  *   non-streaming 200 returns tokens yet leaves the credits untouched — so a
- *   caller that asked for JSON gets the stream folded back (`fold`).
+ *   caller that asked for JSON gets the stream folded back (`fold`);
+ * - tool names within the gateway's 64 characters (`names`, short → the
+ *   agent's own, to put back in the answer; null when none was cut).
  * A body that is not a chat (no `model` + `messages`) gives null.
  */
 function prepareChatBody(parsed, { thinking = true } = {}) {
   if (!parsed || typeof parsed.model !== "string" || !Array.isArray(parsed.messages)) return null
   const body = { ...parsed, model: upstreamModelId(parsed.model) }
+  const names = shortenToolNames(body)
   // `injected`: ours to take back should a model refuse the parameter.
   const injected = thinking && body.thinking === undefined
   if (injected) body.thinking = ENABLE_THINKING
@@ -814,7 +973,208 @@ function prepareChatBody(parsed, { thinking = true } = {}) {
   }
   const fold = body.stream !== true
   body.stream = true
-  return { body, fold, injected }
+  return { body, fold, injected, names }
+}
+
+// ---- tool names over the gateway's limit (#432) -----------------------------
+
+/**
+ * CodeArts turns away a function name over 64 characters ("Function name
+ * […] length over limit, maximum is 64", InferHub.001001017.413), and an
+ * agent's MCP tools are often longer: ZCode's android emulator tool is
+ * `mcp__plugin_android-emulator_android-emulator__android_discover_project`,
+ * 71. A longer name goes as magpie's FlatName cuts one: its first 55
+ * characters, `_`, and 8 hex of its SHA-256, 64 in all. The same name is cut
+ * the same way on every request, so a call in the history keeps matching its
+ * tool, and two names that start alike differ in their hash.
+ */
+const TOOL_NAME_LIMIT = 64
+const TOOL_NAME_KEEP = 55
+
+function cutToolName(name, salt) {
+  let head = name.slice(0, TOOL_NAME_KEEP)
+  // never half a surrogate pair
+  if (/[\uD800-\uDBFF]$/.test(head)) head = head.slice(0, -1)
+  const hex = createHash("sha256").update(salt ? `${name}\u0000${salt}` : name).digest("hex")
+  return `${head}_${hex.slice(0, 8)}`
+}
+
+/** Every place a body names a tool: its tools, its history's calls, tool_choice. */
+function toolNameSlots(body) {
+  const slots = []
+  const slot = (obj, key) => {
+    if (obj && typeof obj === "object" && typeof obj[key] === "string") slots.push({ obj, key })
+  }
+  for (const t of Array.isArray(body.tools) ? body.tools : []) slot(t?.function, "name")
+  for (const f of Array.isArray(body.functions) ? body.functions : []) slot(f, "name")
+  const choice = body.tool_choice
+  if (choice && typeof choice === "object") slot(choice.function, "name")
+  if (body.function_call && typeof body.function_call === "object") slot(body.function_call, "name")
+  for (const m of Array.isArray(body.messages) ? body.messages : []) {
+    if (!m || typeof m !== "object") continue
+    for (const c of Array.isArray(m.tool_calls) ? m.tool_calls : []) slot(c?.function, "name")
+    slot(m.function_call, "name")
+    if (m.role === "tool" || m.role === "function") slot(m, "name")
+  }
+  return slots
+}
+
+/**
+ * Cut every tool name over the limit in body, in place; the map of each cut
+ * name to the agent's own, or null when every name fits. A cut name that is
+ * another tool's own name, or another cut one's, is cut again with a salt,
+ * so the map always leads back to one name.
+ */
+function shortenToolNames(body) {
+  const slots = toolNameSlots(body)
+  if (!slots.some((s) => s.obj[s.key].length > TOOL_NAME_LIMIT)) return null
+  const taken = new Set(slots.map((s) => s.obj[s.key]).filter((n) => n.length <= TOOL_NAME_LIMIT))
+  const short = new Map() // the agent's name → the one sent
+  const names = new Map() // the one sent → the agent's name
+  // In a fixed order, so the same names are cut alike on every request.
+  const long = [...new Set(slots.map((s) => s.obj[s.key]).filter((n) => n.length > TOOL_NAME_LIMIT))].sort()
+  for (const name of long) {
+    let cut = cutToolName(name, 0)
+    for (let salt = 1; taken.has(cut) || names.has(cut); salt += 1) cut = cutToolName(name, salt)
+    short.set(name, cut)
+    names.set(cut, name)
+  }
+  // In place: the body is signedFetch's own parse of the request.
+  for (const s of slots) {
+    const cut = short.get(s.obj[s.key])
+    if (cut) s.obj[s.key] = cut
+  }
+  return names
+}
+
+/** The agent's own names back in a whole completion's tool calls. */
+function restoreToolNames(completion, names) {
+  if (!names) return completion
+  for (const choice of Array.isArray(completion?.choices) ? completion.choices : []) {
+    const msg = choice?.message
+    if (!msg || typeof msg !== "object") continue
+    for (const c of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
+      const name = c?.function?.name
+      if (typeof name === "string" && names.has(name)) c.function.name = names.get(name)
+    }
+    if (msg.function_call && names.has(msg.function_call.name)) msg.function_call.name = names.get(msg.function_call.name)
+  }
+  return completion
+}
+
+/**
+ * A stream with the agent's own names back in its tool calls. A call's name
+ * usually comes whole in one delta; should the gateway send it in pieces, the
+ * pieces of a cut name past its first 55 characters (the part that differs
+ * from the agent's) are held until the name is whole, then the rest of the
+ * agent's name goes in their place. Events that name no cut tool pass as
+ * they came, byte for byte.
+ */
+function restoreToolNamesInStream(stream, names) {
+  if (!names) return stream
+  const cuts = [...names.keys()]
+  const calls = new Map() // `${choice}:${call}` → { got, sent }
+  const enc = new TextEncoder()
+  const dec = new TextDecoder()
+  let pending = ""
+  const named = (key, piece) => {
+    const c = calls.get(key) ?? { got: "", sent: 0 }
+    calls.set(key, c)
+    // A whole cut name in one piece, the call's first or a gateway's repeat
+    // of it in a later delta: the agent's name, whole.
+    if (names.has(piece)) {
+      const own = names.get(piece)
+      c.got = own
+      c.sent = own.length
+      return own
+    }
+    c.got += piece
+    let out
+    if (names.has(c.got)) {
+      const own = names.get(c.got)
+      out = own.slice(c.sent)
+      c.sent = own.length
+      c.got = own // a whole name, matched once
+    } else if (c.got.length < TOOL_NAME_LIMIT && cuts.some((cut) => cut.startsWith(c.got))) {
+      const upTo = Math.min(c.got.length, TOOL_NAME_KEEP)
+      out = upTo > c.sent ? c.got.slice(c.sent, upTo) : ""
+      c.sent = Math.max(c.sent, upTo)
+    } else {
+      out = c.got.slice(c.sent)
+      c.sent = c.got.length
+    }
+    return out
+  }
+  // what was held back of a name that never became whole
+  const held = () => {
+    const choices = []
+    for (const [key, c] of calls) {
+      if (c.sent >= c.got.length) continue
+      const [ci, ti] = key.split(":").map(Number)
+      choices.push({ index: ci, delta: { tool_calls: [{ index: ti, function: { name: c.got.slice(c.sent) } }] } })
+      c.sent = c.got.length
+    }
+    return choices.length ? `data: ${JSON.stringify({ choices })}\n\n` : ""
+  }
+  const line = (l) => {
+    const t = l.replace(/\r$/, "")
+    if (!t.startsWith("data:")) return l
+    const payload = t.slice(5).trim()
+    if (payload === "[DONE]") return held() + l
+    if (!payload.includes("tool_calls") && !payload.includes("function_call")) return l
+    const ev = safeJson(payload)
+    if (!ev || !Array.isArray(ev.choices)) return l
+    let changed = false
+    for (const [ci, choice] of ev.choices.entries()) {
+      const delta = choice?.delta
+      if (!delta || typeof delta !== "object") continue
+      const index = Number.isInteger(choice.index) ? choice.index : ci
+      for (const [k, call] of (Array.isArray(delta.tool_calls) ? delta.tool_calls : []).entries()) {
+        const fn = call?.function
+        if (!fn || typeof fn.name !== "string") continue
+        const out = named(`${index}:${Number.isInteger(call.index) ? call.index : k}`, fn.name)
+        if (out !== fn.name) {
+          fn.name = out
+          changed = true
+        }
+      }
+      if (delta.function_call && typeof delta.function_call.name === "string") {
+        const out = named(`${index}:fc`, delta.function_call.name)
+        if (out !== delta.function_call.name) {
+          delta.function_call.name = out
+          changed = true
+        }
+      }
+    }
+    return changed ? `data: ${JSON.stringify(ev)}${l.endsWith("\r") ? "\r" : ""}` : l
+  }
+  const reader = stream.getReader()
+  return new ReadableStream({
+    async pull(controller) {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) {
+          let rest = pending + dec.decode()
+          pending = ""
+          if (rest) rest = line(rest)
+          rest += held()
+          if (rest) controller.enqueue(enc.encode(rest))
+          controller.close()
+          return
+        }
+        pending += dec.decode(value, { stream: true })
+        const cut = pending.lastIndexOf("\n")
+        if (cut < 0) continue
+        const whole = pending.slice(0, cut)
+        pending = pending.slice(cut + 1)
+        controller.enqueue(enc.encode(whole.split("\n").map(line).join("\n") + "\n"))
+        return
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason)
+    },
+  })
 }
 
 // ---- reading the gateway's answers -----------------------------------------
@@ -869,7 +1229,17 @@ function isRateLimitCode(code) {
 function embeddedErrorStatus(code) {
   if (isRateLimitCode(code)) return 429
   if (/(^|\.)40[0-4](\.|$)|InferHub\.400[0-9]\./.test(String(code ?? ""))) return 400
+  if (isNotMultimodal(code)) return 400
   return 502
+}
+
+/**
+ * An image sent to a text-only model (`InferHub.001001020.406` "The request
+ * model is not multimodal"): the request's content, which no retry and no
+ * other account changes.
+ */
+function isNotMultimodal(codeOrText) {
+  return /InferHub\.001001020\.406|not multimodal/i.test(String(codeOrText ?? ""))
 }
 
 /** Does this event carry part of an answer (not only a role or a keepalive)? */
@@ -1005,7 +1375,7 @@ function completionFromChunks(events) {
 }
 
 /** Answer a caller that asked for JSON: read the whole stream, fold it. */
-async function foldAnswer(res, head) {
+async function foldAnswer(res, head, names = null) {
   let text = head.text
   if (head.reader) {
     for (;;) {
@@ -1019,11 +1389,16 @@ async function foldAnswer(res, head) {
   headers.set("content-type", "application/json")
   const events = parseSseEvents(text)
   if (events.some((ev) => Array.isArray(ev.choices) && ev.choices.length > 0)) {
-    return new Response(JSON.stringify(completionFromChunks(events)), { status: res.status, statusText: res.statusText, headers })
+    return new Response(JSON.stringify(restoreToolNames(completionFromChunks(events), names)), { status: res.status, statusText: res.statusText, headers })
   }
   // The gateway answered JSON after all, or nothing at all.
-  if (Array.isArray(safeJson(text)?.choices)) return new Response(text, { status: res.status, statusText: res.statusText, headers })
-  return errorResponse(502, errorCodeOf(text), firstOf(errorMessageOf(text), "the gateway returned an empty answer"))
+  const whole = safeJson(text)
+  if (Array.isArray(whole?.choices)) {
+    const body = names ? JSON.stringify(restoreToolNames(whole, names)) : text
+    return new Response(body, { status: res.status, statusText: res.statusText, headers })
+  }
+  const code = errorCodeOf(text)
+  return errorResponse(code ? embeddedErrorStatus(code) : 502, code, firstOf(errorMessageOf(text), "the gateway returned an empty answer"))
 }
 
 /** An OpenAI-shaped error carrying the vendor's code and words (magpie adds the provider name). */
@@ -1275,6 +1650,11 @@ async function signedFetch(cred, input, init, context) {
   if (!isSignedHostUrl(url)) return errorResponse(400, "", refusalTo(url))
   const method = String(init?.method ?? req?.method ?? "GET").toUpperCase()
   const baseHeaders = new Headers(init?.headers ?? req?.headers)
+  // magpie says another account, provider or group member follows this
+  // request (X-Magpie-Fallback): a queued request isn't waited out then.
+  // magpie's own header, never CodeArts'
+  const fallback = baseHeaders.get(FALLBACK_HEADER) === "1"
+  baseHeaders.delete(FALLBACK_HEADER)
   let body
   if (init?.body != null) body = await toBytes(init.body)
   else if (req) body = new Uint8Array(await req.clone().arrayBuffer())
@@ -1344,6 +1724,13 @@ async function signedFetch(cred, input, init, context) {
         const queued = queueInfoOf(res.headers)
         if (queued) {
           void res.body?.cancel().catch(() => {})
+          if (fallback) {
+            // the next candidate is asked at once: this one leaves the
+            // queue, and says why it gave way and when to ask it again
+            void traceQueueCall("DELETE", active, queued.traceId, context, AbortSignal.timeout(REQUEST_TIMEOUT_MS)).catch(() => {})
+            const wait = Math.max(1, Math.ceil(queued.retryAfter))
+            return errorResponse(503, "", `CodeArts queued the request; try again in ${wait}s`, { "retry-after": String(wait) })
+          }
           queueDeadline ||= Date.now() + (context.queueBudgetMs ?? QUEUE_BUDGET_MS)
           if ((await waitInQueue(active, queued, context, signal, queueDeadline)) === "promoted") continue
           return errorResponse(429, "", "排队等待超时或已被移出队列，请稍后再试")
@@ -1352,9 +1739,10 @@ async function signedFetch(cred, input, init, context) {
       if (res.ok) {
         const head = await peekAnswer(res)
         if (!head.code) {
-          if (chat.fold) return await foldAnswer(res, head)
+          if (chat.fold) return await foldAnswer(res, head, chat.names)
           handedOver = true
-          return new Response(replayBody(head, release), { status: res.status, statusText: res.statusText, headers: streamHeaders(res.headers) })
+          const stream = restoreToolNamesInStream(replayBody(head, release), chat.names)
+          return new Response(stream, { status: res.status, statusText: res.statusText, headers: streamHeaders(res.headers) })
         }
         text = head.text
         code = head.code
@@ -1408,6 +1796,9 @@ async function signedFetch(cred, input, init, context) {
         }
         return errorResponse(429, SESSION_LIMIT_ERROR, firstOf(errorMessageOf(text), "并发会话数已达上限，请稍后再试"))
       }
+      // an image the model can't take is the request's fault, whatever
+      // status it came with
+      if (!res.ok && isNotMultimodal(code || text)) return errorResponse(400, code, firstOf(errorMessageOf(text), "the model takes no images"))
       if (!res.ok) return rebuildResponse(res, text)
       return errorResponse(embeddedErrorStatus(code), code, firstOf(errorMessageOf(text), "the gateway answered with an error"))
     }
@@ -2097,8 +2488,8 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
     const state = await stateOf(cred)
     if (state.renewed?.from === token) return state.renewed.next
     if (state.renewing?.from !== token) {
-      const promise = refreshCredential(cred, fetcher)
-        .then((next) => {
+      const promise = renewSharedCredential(cred, () => refreshCredential(cred, fetcher))
+        .then(async (next) => {
           state.renewed = { from: token, next }
           return next
         })
@@ -2117,14 +2508,19 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
     // Declared so a caller never sends its own, larger default.
     limit: { context: m.context ?? 0, output: MAX_OUTPUT_TOKENS },
     tool_call: true,
+    // Text only (TEXT_ONLY): said, not left out, so an agent sends no image.
+    attachment: false,
+    modalities: { input: ["text"], output: ["text"] },
   })
 
   const modelOf = (provider, live, state) => {
     const base = provider.models?.[live.id] ?? {}
     const capabilities = {
-      temperature: true, toolcall: true, attachment: false, input: { text: true }, output: { text: true },
+      temperature: true, toolcall: true, output: { text: true }, attachment: false,
       ...(base.capabilities ?? {}),
       ...(live.reasoning ? { reasoning: true } : {}),
+      // what the user's own config says of a kind stands; the rest is text only
+      input: { ...TEXT_ONLY.input, ...(base.capabilities?.input ?? {}) },
     }
     // magpie's own fields: `free` (from the free daily pool, the same answer
     // the signed `maas_type: benefit` header follows, so a model never shows
@@ -2159,7 +2555,13 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       id: PROVIDER,
       async models(provider, { auth } = {}) {
         const cred = credentialOf(auth)
-        if (!cred?.access_key_id) return provider.models
+        if (!cred?.access_key_id) {
+          // A models hook that runs with no auth is a provider with no accounts.
+          noteProviderEmpty(PROVIDER)
+          return provider.models
+        }
+        const identity = accountIdentityOf(cred).id
+        if (identity) noteProviderAccount(PROVIDER, identity)
         try {
           const state = await stateOf(cred)
           const list = await fetchRemoteModels(cred, fetcher, state)
@@ -2181,13 +2583,28 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       async refresh(auth) {
         const cred = credentialOf(auth)
         if (!cred) return undefined
-        const next = await renewOnce(cred)
-        const accountId = auth.accountId ? "" : accountIdentityOf(next).id
+        const renewed = await renewOnce(cred)
+        // A rotation rebuilds the credential: keep the phone, which only the
+        // stored one knows (`renewOnce` carries `session_id` itself), and read
+        // it once for an account signed in before it was being read at all.
+        const next = {
+          ...renewed,
+          ...(cred.user_phone && !renewed.user_phone ? { user_phone: cred.user_phone } : {}),
+        }
+        const identified = next.user_phone ? next : { ...next, ...(await accountPhoneField(next, fetcher)) }
+        const identity = accountIdentityOf(identified)
+        // accountId is the account's identity in magpie (its user-set name,
+        // proxy, model picks and a gateway key's list hang off it), so a
+        // renewal never renames one. An account stored without an accountId at
+        // all gets the URN, as main does — otherwise signing it in again would
+        // add a second row.
+        const accountId = auth.accountId ? "" : identity.id
         return {
-          access: JSON.stringify(next),
-          refresh: next.refresh_token,
-          expires: expiresFromCredential(next),
+          access: JSON.stringify(identified),
+          refresh: identified.refresh_token,
+          expires: expiresFromCredential(identified),
           ...(accountId ? { accountId } : {}),
+          ...(identity.id ? { uid: identity.id } : {}),
         }
       },
 
@@ -2196,6 +2613,8 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         let account = await getAuth()
         let cred = credentialOf(account)
         if (!cred?.access_key_id || !cred?.secret_access_key) return {}
+        const identity = accountIdentityOf(cred).id
+        if (identity) noteProviderAccount(PROVIDER, identity)
 
         // magpie renews ahead of expiry by itself; this covers hosts that
         // ignore `auth.refresh` (OpenCode) and a credential that went stale
@@ -2275,6 +2694,8 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         const auth = await getAuth()
         const cred = credentialOf(auth)
         if (!cred?.access_key_id) return { error: "not signed in", windows: [] }
+        const identity = accountIdentityOf(cred).id
+        if (identity) noteProviderAccount(PROVIDER, identity)
         try {
           const text = await signedGet(SNAP_STATISTICS_URL, cred, fetcher, SNAP_EXTRA_HEADERS)
           if (text === undefined) return { error: "CodeArts answered an error", windows: [] }
@@ -2295,7 +2716,11 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
             grants: readGrants(ledgerPath, await ledgerKey(cred)),
             benefitIds: state.benefit ? [...state.benefit] : BENEFIT_MODEL_FALLBACK,
           })
-          const user = accountIdentityOf(cred).name
+          // The card names the account by its phone, not by IAM's `hw…` id or
+          // its URN — read once here for an account whose credential predates
+          // that read (the next refresh stores it).
+          const phone = firstOf(cred.user_phone) || (await fetchAccountPhone(cred, fetcher))
+          const user = phone || accountIdentityOf(cred).name
           return user ? { ...usage, user } : usage
         } catch (e) {
           return { error: e?.message ?? String(e), windows: [] }
@@ -2342,23 +2767,40 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
             const flow = await startOAuthFlow(fetcher)
             return {
               url: flow.loginUrl,
-              instructions: "Sign in to Huawei Cloud in the browser; this window closes itself when done.",
+              instructions: "Sign in to Huawei Cloud in the browser. This signs in CodeArts only — the OfficeAce card has its own sign-in. This window closes itself when done.",
               method: "auto",
               async callback() {
                 try {
                   const outcome = await flow.result
                   const cred = safeJson(outcome.access)
                   if (!cred?.access_key_id) return { type: "failed", error: "CodeArts did not return a credential" }
-                  // Who signed in, so signing in again replaces the account
-                  // instead of adding a `codearts#xxxxxx` beside it.
-                  const accountId = accountIdentityOf(cred).id
-                  return {
+                  // The card's name is the phone (one read away, best effort:
+                  // a failed read still signs in), shown through usage's
+                  // `user`; the credential carries it as `user_phone`.
+                  const identified = { ...cred, ...(await accountPhoneField(cred, fetcher)) }
+                  // The MaaS pair OfficeAce needs is read once here (best effort:
+                  // an account that never opened MaaS signs in all the same), and
+                  // kept on this credential too, so a later rotation of this
+                  // record hands the other one a credential that still has it.
+                  const withMaas = await withOfficeAceMaas(identified, fetcher)
+                  const identity = accountIdentityOf(withMaas)
+                  // `accountId` is the account's identity — the URN, as main
+                  // gives it — so a re-sign-in replaces the account instead of
+                  // adding a `codearts#xxxxxx`; `uid` is that same URN.
+                  const record = {
                     type: "success",
-                    access: outcome.access,
+                    access: JSON.stringify(withMaas),
                     refresh: cred.refresh_token,
                     expires: outcome.expires,
-                    ...(accountId ? { accountId } : {}),
+                    accountId: identity.id,
+                    ...(identity.id ? { uid: identity.id } : {}),
                   }
+                  // This sign-in writes this card's record only. A Huawei Cloud
+                  // refresh token is spent once, so two records holding one
+                  // token would sign each other out; the other card has its own
+                  // sign-in and its own token.
+                  await writeProviderRecord(client, PROVIDER, withMaas, fetcher)
+                  return record
                 } catch (e) {
                   return { type: "failed", error: e?.message ?? String(e) }
                 } finally {
@@ -2385,7 +2827,12 @@ function nearExpiry(cred) {
  * merged), so the account's other fields — its accountId — go along.
  */
 async function persistCredential(client, account, cred) {
-  const accountId = firstOf(account?.accountId, accountIdentityOf(cred).id)
+  const identity = accountIdentityOf(cred)
+  // `accountId` is the account's identity in magpie, so it stays what main
+  // stores: the URN, and what the record already had first. The phone is in
+  // the credential (`user_phone`) and shown by usage's `user`.
+  const accountId = firstOf(account?.accountId, identity.id)
+  const uid = firstOf(identity.id, account?.uid)
   const body = {
     ...asRecord(account),
     type: "oauth",
@@ -2393,6 +2840,7 @@ async function persistCredential(client, account, cred) {
     refresh: cred.refresh_token,
     expires: expiresFromCredential(cred),
     ...(accountId ? { accountId } : {}),
+    ...(uid ? { uid } : {}),
   }
   try {
     await client?.auth?.set?.({ path: { id: PROVIDER }, body })
@@ -2413,6 +2861,7 @@ export const _internal = {
   generatePkcePair, generateDpopKeyPair, keyPairFromStoredJwk, signDpopJws,
   buildCanonicalRequest, signRequestHuawei,
   credentialFromTokenResponse, credentialOf, expiresFromCredential, accountIdentityOf, accountSessionIds,
+  profileOf, looksLikeIdentifier, maskPhone, fetchAccountPhone, accountPhoneField, IAM_HOST, IAM_USER_URL,
   requestToken, exchangeAuthorizationCode, exchangeRefreshToken, refreshCredential,
   isDeadRefreshToken, isPermanentRefreshFailure, nearExpiry, persistCredential,
   buildOAuthLoginUrl, buildPortalLoginResultUrl,
@@ -2423,9 +2872,1268 @@ export const _internal = {
   readGrants, recordGrant, readUnconfirmed, recordUnconfirmed, grantExpiry, grantBatches, soonestLapse, fetchCreditBatches,
   PACKAGE_CREDIT_PAGE_URL, OPS_CREDIT_OVERVIEW_URL, OPS_CREDIT_CAMPAIGN_URL,
   toBytes, isBenefitModel, prepareChatBody, signedFetch, signedGet,
-  parseSseEvents, errorCodeOf, errorMessageOf, isStaleCredential, isRateLimitCode, embeddedErrorStatus, classifyHead,
+  TOOL_NAME_LIMIT, cutToolName, shortenToolNames, restoreToolNames, restoreToolNamesInStream,
+  parseSseEvents, errorCodeOf, errorMessageOf, isStaleCredential, isRateLimitCode, embeddedErrorStatus, isNotMultimodal, classifyHead,
   peekAnswer, completionFromChunks, createConcurrencyGate, delay, retryDelayMs,
   isRegularModel, queueInfoOf, waitInQueue, TRACE_QUEUE_URL, SESSION_HEADER,
   snapRequest, dailyCheckin,
   parseModelInfo, extractArray, fetchRemoteModels, creditWindow, benefitWindow, usageFromStatistics,
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OfficeAce — a second provider from the same Huawei Cloud sign-in
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// OfficeAce (华为云 AgentArts / MaaS) runs on the same Huawei Cloud IAM account
+// as CodeArts. Measured with a real account on 2026-10-30, read-only:
+//
+//   * a CodeArts STS triple signs OfficeAce's subscription read
+//     (V11-HMAC `GET …/v1/subscription`, HTTP 200, same `domain_id`) and passes
+//     its CLAW permission check (`…/v1/claw/client-permission-validate`);
+//   * an OfficeAce STS triple signs CodeArts' `snap-access` reads byte for byte
+//     the same way the CodeArts triple does.
+//
+// So one credential signs both providers' APIs, but each card signs in on its
+// own and keeps its own record: a Huawei Cloud refresh token is spent once, so
+// one token written into two records would sign one of them out at the other's
+// renewal (`STS5.1806`). The second provider keeps its record in the shape
+// `officeace-auth` (the package this one absorbs) has always written — `access`
+// is a JSON string carrying `modelAppKey` / `securityToken` / `dpopPrivateJwk`
+// … — so the accounts signed in through that package keep working without
+// signing in again. The account is stored under the same provider id it always
+// had (`officeace`), so its records are exactly where magpie already keeps them.
+//
+// A renewal writes only the record being renewed. Nothing is ever written into
+// another record, which is what kept resurrecting an account the user had
+// removed, and a failed renewal never borrows a credential from another chain.
+
+/** The OfficeAce provider id — the one the `officeace-auth` package used. */
+const OFFICEACE_PROVIDER = "officeace"
+const OFFICEACE_NPM = "@ai-sdk/openai-compatible"
+
+// The three domains, never mixed (each measured; see the OfficeAce internals):
+//   CLAW          sign-in permission check (the MaaS appKey lives behind it)
+//   STS           token exchange — the same endpoint CodeArts uses
+//   MaaS          model catalog and chat
+//   subscription  usage, credit rates and the daily check-in
+const OA_CLAW_BASE = "https://agentarts.cn-southwest-2.myhuaweicloud.com"
+const OA_PERMISSION_PATH = "/v1/claw/client-permission-validate"
+const OA_SUBSCRIPTION_BASE = "https://officeace.cn-southwest-2.huaweicloud-agentarts.com"
+const OA_SUBSCRIPTION_PATH = "/v1/subscription"
+const OA_TOKEN_RATES_PATH = "/v1/model-token-rates"
+const OA_BONUS_CLAIM_PATH = "/v1/subscription/bonus/claim"
+const OA_MAAS_MARKET_BASE = "https://api.modelarts-maas.com"
+const OA_MODELS_PATH = "/v2/models"
+const OA_CHAT_PATH = "/v2/chat/completions"
+const OA_REGION = "cn-southwest-2"
+const OA_SERVICE = "apic"
+/** The OAuth client OfficeAce's own sign-in uses (its old package's refreshes). */
+const OA_AGENTARTS_CLIENT_ID = "pdp5_for_agentarts"
+const OA_RATES_TTL_MS = 20 * 60 * 1000
+const OA_REFRESH_LEAD_MS = 10 * 60 * 1000
+const OA_TOKEN_TIMEOUT_MS = 30_000
+
+/** The models OfficeAce shows before anyone is signed in (its own desktop list). */
+const OA_FALLBACK_MODELS = {
+  "glm-5.3": { name: "GLM-5.3", context: 1_000_000, output: 128_000 },
+  "glm-5.2": { name: "GLM-5.2", context: 1_000_000, output: 128_000 },
+  "glm-5.1": { name: "GLM-5.1", context: 1_000_000, output: 128_000 },
+  "deepseek-v4": { name: "DeepSeek-V4", context: 1_000_000, output: 128_000 },
+  "deepseek-v4.1": { name: "DeepSeek-V4.1", context: 1_000_000, output: 128_000 },
+  "qwen3-30b": { name: "Qwen3 30B", context: 1_000_000, output: 128_000 },
+  "qwen3-32b": { name: "Qwen3 32B", context: 1_000_000, output: 128_000 },
+  "kimi-k2.6": { name: "Kimi-K2.6", context: 1_000_000, output: 128_000 },
+  "pangu-2.0-pro": { name: "盘古 2.0 Pro", context: 1_000_000, output: 128_000 },
+  "pangu-2.0-flash": { name: "盘古 2.0 Flash", context: 1_000_000, output: 128_000 },
+}
+
+/**
+ * Registry ids that answer `404 ModelArts.81009 Invalid model` on chat whatever
+ * the headers (measured; `deepseek-v4.1-flash-1017` stays 404 even with
+ * `maas_type: benefit`). Never listed, whatever the catalog says.
+ */
+const OA_UNAVAILABLE_IDS = new Set([
+  "deepseek-v4.1-flash-1017",
+  "deepseek-v4.1-flash-bnt",
+  "deepseek-v4-pro",
+])
+
+/** OfficeAce's own icon (its `.ico` as a 128×128 PNG). */
+const OFFICEACE_ICON = "data:image/png;base64,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"
+
+// ---- one credential, two shapes -------------------------------------------
+
+/**
+ * A Huawei Cloud STS credential in this package's internal shape — the shape
+ * CodeArts has always stored (`access_key_id`, `secret_access_key`,
+ * `security_token`, `refresh_token`, `dpop_private_key_jwk` …) plus the MaaS
+ * fields OfficeAce needs (`model_app_key`, `model_app_secret`, `maas_base_url`).
+ *
+ * OfficeAce's own package stored the same credential under different names
+ * (`access`, `secret`, `securityToken`, `modelAppKey`, `dpopPrivateJwk` …).
+ * `officeAceCredentialOf` reads either and gives this one; `officeAceRecordOf`
+ * writes it back in OfficeAce's shape, so a record is readable by both.
+ */
+function officeAceCredentialOf(auth) {
+  if (!auth) return null
+  const raw = typeof auth.access === "string" ? safeJson(auth.access) : asRecord(auth.access)
+  const flat = raw && typeof raw === "object" ? raw : asRecord(auth)
+  const pick = (...vs) => firstOf(...vs)
+
+  const access = pick(flat.access_key_id, flat.access)
+  const secret = pick(flat.secret_access_key, flat.secret)
+  const securityToken = pick(flat.security_token, flat.securityToken)
+  // A record with only the STS triple is a sign-in too: usage and the check-in
+  // are signed with it alone (the MaaS appKey only guards catalog and chat).
+  if (!access || !secret || !securityToken) return null
+
+  // Which OAuth client issued the refresh token. The CodeArts field names are
+  // this package's own flow; OfficeAce's (`access` / `securityToken`) are the
+  // old package's, whose refreshes were asked for as `pdp5_for_agentarts`.
+  // `oauth_client` is written down when a record says it, so a derived record
+  // is renewed the way it was made.
+  const codeArtsShape = !!flat.access_key_id && !!flat.secret_access_key
+  const profile = profileOf({ refresh_token: pick(flat.refresh_token, auth.refresh) }) || {}
+  const domain = pick(flat.domain_id, flat.accountId, profile.account_id, profile.domain_id)
+  return {
+    access_key_id: access,
+    secret_access_key: secret,
+    security_token: securityToken,
+    expires_at: pick(flat.expires_at, flat.expiresAt, typeof auth.expires === "number" ? new Date(auth.expires).toISOString() : ""),
+    refresh_token: pick(auth.refresh, flat.refresh_token, flat.refreshToken),
+    code_verifier: pick(flat.code_verifier, flat.codeVerifier),
+    dpop_private_key_jwk: flat.dpop_private_key_jwk ?? flat.dpopPrivateJwk ?? null,
+    session_id: pick(flat.session_id),
+    user_phone: pick(flat.user_phone, auth.user_phone),
+    domain_id: domain,
+    model_app_key: pick(flat.model_app_key, flat.modelAppKey),
+    model_app_secret: pick(flat.model_app_secret, flat.modelAppSecret),
+    maas_base_url: pick(flat.maas_base_url, flat.maasBaseUrl),
+    oauth_client: pick(flat.oauth_client, flat.oauthClient, codeArtsShape ? "codearts-agent" : OA_AGENTARTS_CLIENT_ID),
+  }
+}
+
+/** Is this credential one this package's own CodeArts sign-in issued? */
+const isCodeArtsClient = (cred) => cred?.oauth_client === "codearts-agent"
+
+/** The credential as `officeace-auth` stores it (its historical shape). */
+function officeAceCredentialRecord(cred) {
+  const identity = accountIdentityOf(cred)
+  const profile = profileOf(cred) || {}
+  return {
+    modelAppKey: firstOf(cred.model_app_key),
+    modelAppSecret: firstOf(cred.model_app_secret),
+    maasBaseUrl: firstOf(cred.maas_base_url),
+    access: firstOf(cred.access_key_id),
+    secret: firstOf(cred.secret_access_key),
+    securityToken: firstOf(cred.security_token),
+    projectId: "",
+    expiresAt: firstOf(cred.expires_at),
+    refreshToken: firstOf(cred.refresh_token),
+    codeVerifier: firstOf(cred.code_verifier),
+    dpopPrivateJwk: cred.dpop_private_key_jwk ?? null,
+    session_id: firstOf(cred.session_id),
+    accountId: firstOf(profile.account_id, profile.domain_id, cred.domain_id),
+    user_phone: firstOf(cred.user_phone),
+    // A record written from a credential with no marker of its own is one this
+    // package's CodeArts sign-in (or a rotation of it) issued.
+    oauth_client: firstOf(cred.oauth_client, "codearts-agent"),
+    ...(identity.id ? { uid: identity.id } : {}),
+  }
+}
+
+/**
+ * What magpie shows for an OfficeAce account.
+ *
+ * `accountId` is the vendor's own stable id — the IAM domain id, as the record
+ * `officeace-auth` wrote carried — and never the masked phone: the name,
+ * proxy and gateway key a user gives an account hang off `accountId`, so a
+ * phone there is both a display leak and a re-keying of that account (#483,
+ * magpie#4416). The phone is only ever `usage().user`. `uid` is the same id.
+ */
+function officeAceIdentityOf(cred) {
+  const profile = profileOf(cred) || {}
+  const domain = firstOf(profile.account_id, profile.domain_id, cred?.domain_id)
+  return { accountId: domain, uid: domain }
+}
+
+/** The `{type, refresh, access, expires, accountId, uid}` magpie keeps for OfficeAce. */
+function officeAceRecordBody(cred) {
+  const identity = officeAceIdentityOf(cred)
+  return {
+    type: "oauth",
+    refresh: firstOf(cred.refresh_token),
+    access: JSON.stringify(officeAceCredentialRecord(cred)),
+    expires: expiresFromCredential(cred),
+    ...(identity.accountId ? { accountId: identity.accountId } : {}),
+    ...(identity.uid ? { uid: identity.uid } : {}),
+  }
+}
+
+/** The same record in CodeArts' shape (for the sibling write). */
+function codeArtsRecordBody(cred) {
+  const identity = accountIdentityOf(cred)
+  return {
+    type: "oauth",
+    refresh: firstOf(cred.refresh_token),
+    access: JSON.stringify(cred),
+    expires: expiresFromCredential(cred),
+    ...(identity.id ? { accountId: identity.id, uid: identity.id } : {}),
+  }
+}
+
+/** The MaaS base URL a credential names, or the official one (空串/裸域名 both handled). */
+function officeAceMaasBase(cred) {
+  const raw = cred?.maas_base_url
+  if (typeof raw !== "string" || raw.length === 0) return OA_MAAS_MARKET_BASE
+  const trimmed = raw.replace(/\/+$/, "")
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+}
+
+// ---- V11-HMAC-SHA256: what the subscription API checks --------------------
+
+/** `20261030T081500Z` — the X-Sdk-Date form both Huawei signers use. */
+function oaSdkDate(now = new Date()) {
+  return now.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")
+}
+
+/**
+ * Sign one OfficeAce subscription request (V11-HMAC-SHA256).
+ *
+ * The differences from the SDK-HMAC signer above are all load-bearing (each
+ * was measured against the live gateway):
+ *   * the key is derived: HMAC(HMAC(access, secret), scope + 0x01), first 32
+ *     bytes hex, and that hex string is the signing key;
+ *   * `X-Security-Token` and `x-subscription-type: v2` are mandatory;
+ *   * the canonical URI is decoded and re-encoded segment by segment.
+ */
+function signOfficeAceV11(urlStr, cred, method = "GET", body, dateOverride) {
+  const url = new URL(urlStr)
+  const xdate = dateOverride ?? oaSdkDate()
+  const path = url.pathname.split("/").map((s) => rfc3986(decodeURIComponent(s))).join("/")
+  const canonicalUri = path.endsWith("/") ? path : `${path}/`
+
+  const original = {
+    "x-subscription-type": "v2",
+    "X-Sdk-Date": xdate,
+    "X-Security-Token": String(cred.security_token ?? "").trim(),
+    Host: url.host,
+  }
+  if (method === "POST") original["Content-Type"] = "application/json;charset=utf8"
+  if (cred.project_id) original["X-Project-ID"] = cred.project_id
+
+  const lower = {}
+  for (const [k, v] of Object.entries(original)) lower[k.toLowerCase()] = String(v).trim().replace(/\s+/g, " ")
+  const signedHeaders = Object.keys(lower).sort()
+  const canonicalHeaders = signedHeaders.map((h) => `${h}:${lower[h]}\n`).join("")
+
+  const payloadHash = createHash("sha256").update(body ?? "", "utf8").digest("hex")
+  const canonicalRequest = [
+    method, canonicalUri, canonicalQuery(url), canonicalHeaders, signedHeaders.join(";"), payloadHash,
+  ].join("\n")
+
+  const scope = `${xdate.slice(0, 8)}/${OA_REGION}/${OA_SERVICE}`
+  const stringToSign = [
+    "V11-HMAC-SHA256", xdate, scope, createHash("sha256").update(canonicalRequest).digest("hex"),
+  ].join("\n")
+
+  const u1 = createHmac("sha256", cred.access_key_id).update(cred.secret_access_key).digest()
+  const derivedKey = createHmac("sha256", u1)
+    .update(Buffer.concat([Buffer.from(scope, "utf8"), Buffer.from([1])]))
+    .digest()
+    .subarray(0, 32)
+    .toString("hex")
+  const signature = createHmac("sha256", Buffer.from(derivedKey, "utf8")).update(stringToSign).digest("hex")
+
+  return {
+    ...original,
+    Authorization: `V11-HMAC-SHA256 Credential=${cred.access_key_id}/${scope}, SignedHeaders=${signedHeaders.join(";")}, Signature=${signature}`,
+  }
+}
+
+/** One signed OfficeAce request; a network error is `status: 0` with its reason. */
+async function officeAceSigned(cred, urlStr, method = "GET", body, fetcher = fetch) {
+  const headers = signOfficeAceV11(urlStr, cred, method, body)
+  try {
+    const res = await fetcher(urlStr, {
+      method,
+      headers,
+      ...(body === undefined ? {} : { body }),
+      signal: AbortSignal.timeout(OA_TOKEN_TIMEOUT_MS),
+    })
+    const text = await res.text().catch(() => "")
+    return { ok: res.ok, status: res.status, text }
+  } catch (e) {
+    return { ok: false, status: 0, text: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+// ---- the MaaS appKey: the CLAW permission check --------------------------
+
+/**
+ * Read the account's MaaS Basic credentials and base URL from the CLAW
+ * permission check — the same call OfficeAce's own sign-in ends with, signed
+ * with the STS triple every Huawei Cloud sign-in yields. An account that has
+ * not opened MaaS answers without `model_auth_info`: that is not a failure,
+ * it only means catalog/chat have nothing to use yet.
+ */
+async function fetchOfficeAceMaasInfo(cred, fetcher = fetch) {
+  const url = `${OA_CLAW_BASE}${OA_PERMISSION_PATH}`
+  const extra = { "content-type": "application/json" }
+  const signed = await signRequestHuawei(
+    cred.access_key_id, cred.secret_access_key, cred.security_token, "GET", url, new Uint8Array(), extra,
+  )
+  const headers = new Headers()
+  signed.forEach((value, key) => {
+    if (key !== "host") headers.set(key, value)
+  })
+  const res = await fetcher(url, { method: "GET", headers, redirect: "error", signal: AbortSignal.timeout(OA_TOKEN_TIMEOUT_MS) })
+  if (!res.ok) throw new Error(`OfficeAce permission check failed: HTTP ${res.status}`)
+  const body = await res.json().catch(() => null)
+  const info = body?.subscription?.model_info
+  const auth = info?.model_auth_info
+  return {
+    model_app_key: typeof auth?.model_app_key === "string" ? auth.model_app_key : "",
+    model_app_secret: typeof auth?.model_app_secret === "string" ? auth.model_app_secret : "",
+    maas_base_url: typeof info?.model_api_url_base === "string" ? info.model_api_url_base : "",
+  }
+}
+
+/** The MaaS fields of one account, read at most once per process (best effort). */
+const oaMaasCache = new Map() // identity → { at, info }
+
+async function officeAceMaasInfo(cred, fetcher = fetch) {
+  const identity = accountIdentityOf(cred).id || cred.session_id || cred.access_key_id
+  const hit = oaMaasCache.get(identity)
+  if (hit && Date.now() - hit.at < 6 * 60 * 60 * 1000) return hit.info
+  const info = await fetchOfficeAceMaasInfo(cred, fetcher).catch(() => null)
+  if (info) oaMaasCache.set(identity, { at: Date.now(), info })
+  return info
+}
+
+// ---- the OfficeAce API ---------------------------------------------------
+
+/** Credit multipliers per account; a failed read keeps the last good table. */
+const oaRatesCache = new Map() // identity → { at, map }
+
+/**
+ * `GET {SUB}/v1/model-token-rates` — the billable list. It is the whitelist the
+ * catalog is cut down to: the catalog lists 26 registry entries, 19 of which
+ * cannot be called; the rates list is what the OfficeAce desktop shows.
+ *
+ * A failure returns the last good table rather than an empty one: an empty
+ * table would disable the whitelist downstream and put the uncallable ids back
+ * in front of the user (measured defect, 2026-10-26).
+ */
+async function fetchOfficeAceTokenRates(cred, fetcher = fetch) {
+  const identity = accountIdentityOf(cred).id || cred.session_id || cred.access_key_id
+  const hit = oaRatesCache.get(identity)
+  if (hit && hit.map.size > 0 && Date.now() - hit.at < OA_RATES_TTL_MS) return hit.map
+  const keepStale = () => {
+    if (hit) oaRatesCache.set(identity, { at: Date.now(), map: hit.map })
+    return hit?.map ?? new Map()
+  }
+
+  const r = await officeAceSigned(cred, `${OA_SUBSCRIPTION_BASE}${OA_TOKEN_RATES_PATH}`, "GET", undefined, fetcher)
+  if (!r.ok) return keepStale()
+  let j
+  try {
+    j = JSON.parse(r.text)
+  } catch {
+    return keepStale()
+  }
+  const rows = Array.isArray(j) ? j : Array.isArray(j?.models) ? j.models : Array.isArray(j?.data) ? j.data : Array.isArray(j?.rates) ? j.rates : []
+  const map = new Map()
+  for (const row of rows) {
+    const raw = row?.model_name ?? row?.modelName ?? row?.model ?? row?.name
+    // the vendor's `model_name` carries a trailing newline ("kimi-k3\n")
+    const name = typeof raw === "string" ? raw.trim() : ""
+    const rate = Number(row?.cost_coefficient ?? row?.costCoefficient ?? row?.rate)
+    if (name && Number.isFinite(rate)) map.set(name, rate)
+  }
+  if (map.size === 0) return keepStale()
+  oaRatesCache.set(identity, { at: Date.now(), map })
+  return map
+}
+
+/** `GET {maas}/v2/models`, names carrying the account's multiplier (`· x1.5`). */
+async function fetchOfficeAceCatalog(cred, fetcher = fetch) {
+  const r = await fetcher(`${officeAceMaasBase(cred)}${OA_MODELS_PATH}`, {
+    headers: { Accept: "application/json", Authorization: basicAuthorization(cred) },
+    signal: AbortSignal.timeout(OA_TOKEN_TIMEOUT_MS),
+  })
+  if (!r.ok) throw new Error(`OfficeAce catalog read failed: HTTP ${r.status}`)
+  const body = await r.json().catch(() => null)
+  const rows = Array.isArray(body) ? body : Array.isArray(body?.data) ? body.data : []
+  const rates = await fetchOfficeAceTokenRates(cred, fetcher).catch(() => new Map())
+  const out = []
+  for (const row of rows) {
+    const id = (typeof row === "string" ? row : typeof row?.id === "string" ? row.id : "").trim()
+    if (!id) continue
+    const base = typeof row?.name === "string" && row.name.trim() ? row.name.trim() : id
+    const rate = rates.get(id)
+    out.push({ id, name: rate !== undefined && rate !== 1 ? `${base} · x${rate}` : base })
+  }
+  return out
+}
+
+/** One OfficeAce model entry, as magpie wants it. */
+function officeAceModelEntry({ id, name, baseUrl = OA_MAAS_MARKET_BASE, context = 1_000_000, output = 128_000 }) {
+  return {
+    id,
+    name,
+    api: { id, url: `${baseUrl}/v2`, npm: OFFICEACE_NPM },
+    status: "active",
+    headers: {},
+    options: {},
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    limit: { context, output },
+    capabilities: {
+      temperature: true,
+      reasoning: true,
+      attachment: false,
+      toolcall: true,
+      input: { text: true, image: false, audio: false, video: false, pdf: false },
+      output: { text: true, image: false, audio: false, video: false, pdf: false },
+      interleaved: false,
+    },
+    release_date: "",
+    variants: {},
+  }
+}
+
+/** The static table `config` hands magpie before a sign-in (never "0 models"). */
+function officeAceStaticModels() {
+  const out = {}
+  for (const [id, def] of Object.entries(OA_FALLBACK_MODELS)) {
+    out[id] = officeAceModelEntry({ id, name: def.name, context: def.context, output: def.output })
+  }
+  return out
+}
+
+/** The account's own catalog: catalog ∩ rates, minus the ids that always 404. */
+function officeAceLiveModels(rows, baseUrl, rates) {
+  const out = {}
+  for (const row of rows) {
+    const id = typeof row === "string" ? row : row?.id
+    if (typeof id !== "string" || id.length === 0) continue
+    if (OA_UNAVAILABLE_IDS.has(id)) continue
+    if (rates && rates.size > 0 && !rates.has(id)) continue
+    const known = OA_FALLBACK_MODELS[id]
+    out[id] = officeAceModelEntry({
+      id,
+      name: typeof row?.name === "string" && row.name.length > 0 ? row.name : id,
+      baseUrl,
+      context: known?.context ?? 1_000_000,
+      output: known?.output ?? 128_000,
+    })
+  }
+  return out
+}
+
+/**
+ * One usage window.
+ *
+ * An expired bucket is folded away (`aside`) and carries no amount/limit: its
+ * own total would become the denominator and read as "100% left". It takes no
+ * part in routing either, so the fold is all it needs to say.
+ */
+function officeAceWindow({ name, used, display, unit, resetsAt = "", expired = false, amount = 0, limit = 0 }) {
+  return {
+    name,
+    used,
+    display,
+    unit,
+    ...(resetsAt ? { resetsAt } : {}),
+    ...(expired ? { aside: true } : { amount, limit, span: 0 }),
+  }
+}
+
+/**
+ * `GET {SUB}/v1/subscription` → magpie windows.
+ *
+ * Two kinds of bucket: `skus[].quotas[]` (`sku_attr_code === 'officeace_points'`)
+ * and `bonus_skus[]`. A `.trial` sku carries no expiry (the trial never
+ * expires — show it as it is, never guess a date); an expired bucket is marked
+ * `aside` so the card folds it away instead of letting it hold the top slot.
+ */
+async function fetchOfficeAceUsage(cred, fetcher = fetch) {
+  const r = await officeAceSigned(cred, `${OA_SUBSCRIPTION_BASE}${OA_SUBSCRIPTION_PATH}`, "GET", undefined, fetcher)
+  if (!r.ok) {
+    const detail = r.text.trim().slice(0, 200)
+    throw new Error(`订阅查询失败：HTTP ${r.status}${detail === "" ? "" : `：${detail}`}`)
+  }
+  let j
+  try {
+    j = JSON.parse(r.text)
+  } catch {
+    throw new Error("订阅查询失败：响应不是 JSON")
+  }
+
+  const round = (n) => Math.round(n * 100) / 100
+  const windows = []
+  const nowMs = Date.now()
+  let plan = ""
+
+  for (const sku of Array.isArray(j?.skus) ? j.skus : []) {
+    for (const q of Array.isArray(sku?.quotas) ? sku.quotas : []) {
+      if (q?.sku_attr_code !== "officeace_points") continue
+      const total = Number(q.sku_value)
+      const used = Number(q.current_value)
+      if (!Number.isFinite(total) || total <= 0) continue
+      const isTrial = String(sku.sku_code ?? "").endsWith(".trial")
+      const expiresAt = typeof q.expired_time === "string" && q.expired_time.length > 0 ? q.expired_time : null
+      const remaining = Math.max(0, total - used)
+      const expired = expiresAt !== null && !isTrial && new Date(expiresAt).getTime() <= nowMs
+      if (!plan && typeof sku.sku_name === "string") plan = sku.sku_name
+      windows.push(officeAceWindow({
+        name: `${sku.sku_name ?? "套餐"} · 剩 ${round(remaining)}`,
+        used: Math.min(100, Math.max(0, Math.round((used / total) * 100))),
+        // a `.trial` sku carries no expiry: nothing to invent
+        resetsAt: isTrial || expiresAt === null ? "" : new Date(expiresAt).toISOString(),
+        display: `${round(remaining)} / ${round(total)}`,
+        unit: "积分",
+        expired,
+        amount: used,
+        limit: total,
+      }))
+    }
+  }
+
+  for (const bonus of Array.isArray(j?.bonus_skus) ? j.bonus_skus : []) {
+    const points = Number(bonus?.points)
+    if (!Number.isFinite(points) || points <= 0) continue
+    const used = Number(bonus.current_value)
+    const remaining = Math.max(0, points - (Number.isFinite(used) ? used : 0))
+    const expiresAt = typeof bonus.expired_time === "string" ? bonus.expired_time : null
+    const expired = expiresAt !== null && new Date(expiresAt).getTime() <= nowMs
+    windows.push(officeAceWindow({
+      name: `${bonus.activity_name ?? "活动奖励"} · 剩 ${round(remaining)}`,
+      used: Math.min(100, Math.round(((points - remaining) / points) * 100)),
+      resetsAt: expiresAt === null ? "" : new Date(expiresAt).toISOString(),
+      display: `${round(remaining)} / ${round(points)}`,
+      unit: "积分",
+      expired,
+      amount: points - remaining,
+      limit: points,
+    }))
+  }
+
+  return { plan, windows }
+}
+
+/**
+ * `POST {SUB}/v1/subscription/bonus/claim` — the daily check-in.
+ *
+ * Claiming twice is idempotent: a 2xx with no `bonus_skus` is `done` (today's
+ * already taken), not a failure. A 2xx that does not parse is `done` too (the
+ * claim itself may have gone through).
+ */
+async function officeAceCheckin(cred, fetcher = fetch) {
+  if (!cred?.access_key_id || !cred?.security_token) {
+    return { outcome: "failed", message: "凭据缺失（access 或 securityToken），未发起签到" }
+  }
+  const r = await officeAceSigned(cred, `${OA_SUBSCRIPTION_BASE}${OA_BONUS_CLAIM_PATH}`, "POST", undefined, fetcher)
+  if (!r.ok || r.status < 200 || r.status >= 300) {
+    const detail = r.text.trim().slice(0, 200)
+    return {
+      outcome: "failed",
+      message: `HTTP ${r.status === 0 ? "（未发出/无响应）" : r.status}${detail === "" ? "" : `：${detail}`}`,
+    }
+  }
+  if (r.text.length === 0) return { outcome: "claimed", message: "已领取（响应为空）" }
+  let j
+  try {
+    j = JSON.parse(r.text)
+  } catch {
+    return { outcome: "done", message: "已领取（响应无法解析）" }
+  }
+  const skus = (Array.isArray(j?.bonus_skus) ? j.bonus_skus : []).map((s) => ({
+    name: typeof s?.activity_name === "string" ? s.activity_name : "活动奖励",
+    points: Number(s?.points) || 0,
+  }))
+  const credit = skus.reduce((sum, s) => sum + s.points, 0)
+  if (skus.length === 0) return { outcome: "done", message: "今日已无新增可领" }
+  return {
+    outcome: "claimed",
+    ...(credit > 0 ? { credit } : {}),
+    message: skus.map((s) => `${s.name} +${s.points}`).join("；"),
+  }
+}
+
+/** `officeace/<id>` → `<id>`: magpie names the model with the provider prefix. */
+function officeAceStripPrefix(body) {
+  if (typeof body !== "string" || body.length === 0) return body
+  try {
+    const parsed = JSON.parse(body)
+    if (typeof parsed?.model === "string" && parsed.model.startsWith("officeace/")) {
+      parsed.model = parsed.model.slice("officeace/".length)
+      return JSON.stringify(parsed)
+    }
+  } catch {
+    // not JSON: pass it through
+  }
+  return body
+}
+
+/** `base64(appKey:appSecret)` — MaaS takes Basic, the AI SDK only sends Bearer. */
+function basicAuthorization(cred) {
+  return "Basic " + Buffer.from(`${cred.model_app_key}:${cred.model_app_secret}`).toString("base64")
+}
+
+const oaBasicFingerprint = (cred) => `${cred?.model_app_key ?? ""}:${cred?.model_app_secret ?? ""}:${cred?.maas_base_url ?? ""}`
+
+/** Is this 4xx the gateway refusing the Basic pair itself? */
+function isOfficeAceBasicRejection(status, text) {
+  if (status === 401 || status === 403) return true
+  if (status < 400 || status >= 500) return false
+  return /APIG\.1009|invalid.*(app|key|secret)|appkey|app_key/i.test(text ?? "")
+}
+
+/**
+ * One chat request to OfficeAce's MaaS: Bearer is rewritten to Basic, the
+ * provider prefix stripped. A 401 (or the gateway naming the Basic pair)
+ * renews the credential once and sends the request again — but only when the
+ * renewal actually changed the pair; retrying the same pair would just be the
+ * same refusal with more latency.
+ */
+async function officeAceChatFetch({ input, init, credential, renew, fetcher = fetch }) {
+  const req = input instanceof Request ? input : null
+  const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (req?.url ?? "")
+  let body = init?.body
+  if (body === undefined && req) body = await req.text()
+  body = officeAceStripPrefix(body)
+  const target = `${officeAceMaasBase(credential)}${OA_CHAT_PATH}`
+  const signal = init?.signal ?? req?.signal ?? AbortSignal.timeout(OA_TOKEN_TIMEOUT_MS)
+
+  const call = (cred) =>
+    fetcher(target, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: basicAuthorization(cred) },
+      body,
+      signal,
+    })
+
+  const response = await call(credential)
+  if (response.ok) return response
+
+  const text = await response.text().catch(() => "")
+  let status = response.status
+  let said = text
+  let renewal = "not-attempted"
+  if (renew && (status === 401 || isOfficeAceBasicRejection(status, said))) {
+    const before = oaBasicFingerprint(credential)
+    let renewed
+    try {
+      renewed = await renew()
+    } catch {
+      renewed = undefined
+    }
+    if (!renewed) renewal = "unreadable"
+    else if (oaBasicFingerprint(renewed) !== before) {
+      renewal = "changed"
+      const retry = await call(renewed)
+      if (retry.ok) return retry
+      status = retry.status
+      said = await retry.text().catch(() => "")
+    } else {
+      renewal = "unchanged"
+    }
+  }
+
+  return Response.json(
+    {
+      error: {
+        type: "provider_error",
+        message:
+          `OfficeAce（华为 MaaS）返回 HTTP ${status}：${said.slice(0, 200)}（${officeAceDiagnose(status, renewal)}）`,
+        provider_status: status,
+        credential_rejected: isOfficeAceBasicRejection(status, said),
+        renewal_outcome: renewal,
+      },
+    },
+    { status: status >= 400 ? status : 502 },
+  )
+}
+
+/** One sentence a person can act on. */
+function officeAceDiagnose(status, renewal) {
+  if (status === 401 || status === 403) {
+    if (renewal === "changed") return "续期后仍然是 401，请重新登录"
+    if (renewal === "unchanged") return "凭据没变，重试无意义，请重新登录"
+    if (renewal === "unreadable") return "续期失败，请重新登录"
+    return "凭据被拒，请重新登录"
+  }
+  if (status === 404) return "模型名不对，或该模型不在这个账号的套餐里"
+  if (status === 429) return "被限流，稍后重试或换账号"
+  if (status >= 500) return "上游服务错误"
+  return "请求被拒"
+}
+
+// ---- the two records of one account --------------------------------------
+//
+// magpie keeps accounts per provider id, and a provider's hooks only ever see
+// that provider's own account — there is no call to read another provider's
+// record. So the two records of one Huawei Cloud account are written the one
+// way the host offers: `client.auth.set` from inside a sign-in or a renewal.
+//
+// What is remembered here is in this module, shared by the package's two
+// plugins (one process, one module): which accounts each provider has, which
+// key this package wrote, and the renewal in flight for each refresh chain. A
+// record is never written to a key another account may sit at, and a record
+// that already holds the account is never written again.
+//
+// Each record holds its own refresh token: a sign-in writes this card's record
+// only, so the two cards of one account are two chains — an `officeace-auth`
+// record was issued to `pdp5_for_agentarts`, a CodeArts record to
+// `codearts-agent`. Each is only ever renewed with its own token, a renewal
+// writes no other record (the host's `auth.set` creates a record that is not
+// there), and a failed renewal fails instead of borrowing another chain's.
+
+/** provider id → the identities its accounts were seen as. */
+const seenProviderAccounts = new Map()
+/** refresh chain → { from, promise }: the renewal in flight. */
+const renewalGates = new Map()
+/** refresh token → the lineage it belongs to (a rotation keeps its parent's). */
+const refreshLineages = new Map()
+/** How long a spent token's renewal stands in for it. */
+const CHAIN_LIVE_MS = 10 * 60 * 1000
+/** How many token lineages are remembered: one per rotation, oldest dropped. */
+const LINEAGE_CAP = 1024
+
+/** A stable 8-hex suffix of the account's identity — a key no other account gets. */
+function accountKeySuffix(identity) {
+  return createHash("sha256").update(String(identity)).digest("hex").slice(0, 8)
+}
+
+/** The OAuth client a credential's refresh token was issued to. */
+function refreshClientOf(cred) {
+  // A canonical credential with no marker of its own is this package's own shape
+  // (the CodeArts reader stamps it); only the old OfficeAce chain says pdp5.
+  return firstOf(cred?.oauth_client) === OA_AGENTARTS_CLIENT_ID ? OA_AGENTARTS_CLIENT_ID : "codearts-agent"
+}
+
+/**
+ * The lineage a refresh token belongs to. A token never seen is its own
+ * lineage; a rotation answers a new token for the same chain, and
+ * `linkRotation` writes that down — so a record still holding the spent token
+ * is known to belong to the chain that replaced it.
+ */
+function lineageOf(token) {
+  const held = refreshLineages.get(token)
+  if (held) return held
+  const fresh = createHash("sha256").update(`refresh-chain\n${token}`).digest("hex").slice(0, 16)
+  rememberLineage(token, fresh)
+  return fresh
+}
+
+function rememberLineage(token, lineage) {
+  if (!token || !lineage) return
+  if (!refreshLineages.has(token) && refreshLineages.size >= LINEAGE_CAP) {
+    // Oldest first. Forgetting a lineage only means a chain is not recognised —
+    // that record then spends its own token and fails; two chains never merge.
+    const oldest = refreshLineages.keys().next().value
+    if (oldest !== undefined) refreshLineages.delete(oldest)
+  }
+  refreshLineages.set(token, lineage)
+}
+
+/**
+ * The refresh chain a credential's token belongs to: the OAuth client it was
+ * issued to, plus the token's lineage. STS spends a refresh token once, so the
+ * chain is the unit of coordination — and a token issued to one client must
+ * never be sent to the other, which is why the client is in the key too.
+ *
+ * The token, not the account: two records of one Huawei Cloud account can sit
+ * on two chains, and one must never be renewed with the other's credential.
+ */
+function refreshChainOf(cred, client = refreshClientOf(cred)) {
+  const token = firstOf(cred?.refresh_token)
+  if (!token) return { key: "", client, token, lineage: "" }
+  const lineage = lineageOf(token)
+  return { key: `${client}\n${lineage}`, client, token, lineage }
+}
+
+/** A rotation answers a new refresh token for the same chain: remember the parent. */
+function linkRotation(cred, next) {
+  const from = firstOf(cred?.refresh_token)
+  const to = firstOf(next?.refresh_token)
+  if (!from || !to || from === to) return
+  rememberLineage(to, lineageOf(from))
+}
+
+function noteProviderAccount(provider, identity) {
+  if (!provider || !identity) return
+  const set = seenProviderAccounts.get(provider) ?? new Set()
+  set.add(identity)
+  seenProviderAccounts.set(provider, set)
+}
+
+/** The provider was listed with no account at all: it has none, as far as this process knows. */
+function noteProviderEmpty(provider) {
+  // No accounts: any identity this process saw before is gone from the provider
+  // now, so the set is emptied (a stale identity is not an account).
+  seenProviderAccounts.set(provider, new Set())
+}
+
+/**
+ * Where a record for `identity` may be written under `provider`: the provider's
+ * own key while it has no account at all, otherwise a key of its identity's
+ * own that no account can be sitting at. `null` when that provider already has
+ * this account (writing again would add a second record of one account).
+ */
+function recordKeyFor(provider, identity) {
+  const known = seenProviderAccounts.get(provider)
+  if (known?.has(identity)) return null
+  if (known && known.size === 0) return provider
+  return `${provider}#${accountKeySuffix(identity)}`
+}
+
+/** Give the credential the MaaS fields OfficeAce needs (one read per account). */
+async function withOfficeAceMaas(cred, fetcher = fetch) {
+  if (cred.model_app_key) return cred
+  const info = await officeAceMaasInfo(cred, fetcher).catch(() => null)
+  // An answer without a pair means "MaaS is not opened for this account": it is
+  // not a reason to take a pair the credential already has away.
+  if (!info?.model_app_key) return cred
+  return { ...cred, ...info }
+}
+
+/**
+ * Write one account's record under `target`, in that provider's own shape.
+ * Used at a sign-in, so the card that signed in keeps its record where a later
+ * renewal can find it again. Only ever called for the card's own provider:
+ * writing one sign-in into two records is what `STS5.1806` was about.
+ */
+async function writeProviderRecord(client, target, cred, fetcher = fetch) {
+  const identity = accountIdentityOf(cred).id
+  if (!identity || !client?.auth?.set) return null
+  const key = recordKeyFor(target, identity)
+  if (!key) return null
+  const body = target === OFFICEACE_PROVIDER
+    ? officeAceRecordBody(await withOfficeAceMaas(cred, fetcher))
+    : codeArtsRecordBody(cred)
+  try {
+    await client.auth.set({ path: { id: key }, body })
+  } catch {
+    return null
+  }
+  return { key, body }
+}
+
+/**
+ * Renew one Huawei Cloud credential, once per refresh chain.
+ *
+ * One credential, renewed once: callers holding the same record (same chain, same
+ * token) share a single in-flight renewal, so STS is asked once and everyone gets
+ * that answer. Records on different chains (an `officeace-auth` record beside a
+ * CodeArts one) never meet in here at all — each spends its own token, and a
+ * renewal that fails is a failure, never another chain's credential.
+ */
+function renewSharedCredential(cred, run, client = refreshClientOf(cred)) {
+  const token = firstOf(cred?.refresh_token)
+  const chain = refreshChainOf(cred, client)
+  if (!chain.key) return Promise.resolve().then(run)
+  const held = renewalGates.get(chain.key)
+  if (held && held.from === token) return held.promise
+  const promise = Promise.resolve()
+    .then(run)
+    .then((next) => {
+      // A rotation rebuilds only the STS half of a credential: what the account
+      // carries besides it (its MaaS pair, its phone, its session) stays.
+      for (const k of ["model_app_key", "model_app_secret", "maas_base_url", "user_phone", "domain_id", "oauth_client"]) {
+        if (cred[k] && !next[k]) next[k] = cred[k]
+      }
+      // The new token belongs to the same chain: a record still holding the
+      // spent one is known to be on it (the gate above). Nothing else is
+      // remembered, so a credential a hook merely saw can never stand in for a
+      // newer one.
+      linkRotation(cred, next)
+      return next
+    })
+    .finally(() => {
+      if (renewalGates.get(chain.key)?.promise === promise) renewalGates.delete(chain.key)
+    })
+  renewalGates.set(chain.key, { from: token, promise })
+  return promise
+}
+
+/**
+ * Renew a credential through the OAuth client that issued its refresh token:
+ * this package's CodeArts flow (verifier + DPoP key, no client change), or the
+ * old OfficeAce flow (`pdp5_for_agentarts`, DPoP key only).
+ */
+async function renewOfficeAceCredential(cred, fetcher = fetch) {
+  if (!cred.refresh_token) {
+    throw Object.assign(new Error("OfficeAce 凭据无法续期（没有 refresh token），请重新登录"), { signIn: "expired" })
+  }
+  if (!cred.dpop_private_key_jwk) {
+    throw Object.assign(new Error("OfficeAce 凭据无法续期（DPoP 私钥缺失），请重新登录"), { signIn: "expired" })
+  }
+  const keyPair = keyPairFromStoredJwk(cred.dpop_private_key_jwk)
+  const client = refreshClientOf(cred)
+  const token = client === "codearts-agent"
+    ? await requestToken({
+        client_id: CLIENT_ID,
+        code_verifier: firstOf(cred.code_verifier),
+        grant_type: GRANT_REFRESH_TOKEN,
+        refresh_token: firstOf(cred.refresh_token),
+      }, keyPair, fetcher, "OfficeAce")
+    : await requestToken({
+        client_id: OA_AGENTARTS_CLIENT_ID,
+        grant_type: GRANT_REFRESH_TOKEN,
+        refresh_token: firstOf(cred.refresh_token),
+      }, keyPair, fetcher, "OfficeAce")
+  const next = credentialFromTokenResponse(token, firstOf(cred.code_verifier), keyPair)
+  // What a rotation does not rebuild: the account's one upstream session, its
+  // identity, its phone and the MaaS credentials behind the preserved appKey.
+  for (const k of ["session_id", "domain_id", "user_phone", "model_app_key", "model_app_secret", "maas_base_url", "oauth_client"]) {
+    if (cred[k]) next[k] = cred[k]
+  }
+  if (!next.refresh_token) next.refresh_token = cred.refresh_token
+  if (!next.oauth_client) next.oauth_client = client
+  // The MaaS Basic pair is minted per permission check and can rotate with the
+  // session: read it again when this account has one. Best effort — the stored
+  // pair stands when the CLAW call is down.
+  if (cred.model_app_key) {
+    const info = await fetchOfficeAceMaasInfo(next, fetcher).catch(() => null)
+    if (info?.model_app_key) {
+      Object.assign(next, info)
+      oaMaasCache.set(accountIdentityOf(next).id || next.access_key_id, { at: Date.now(), info })
+    }
+  }
+  return next
+}
+
+/**
+ * Is this credential close enough to its expiry to renew first?
+ */
+function nearOfficeAceExpiry(cred) {
+  const at = Date.parse(firstOf(cred?.expires_at))
+  return Number.isFinite(at) && at - Date.now() <= OA_REFRESH_LEAD_MS
+}
+
+/**
+ * Store an OfficeAce record for the account this hook runs for (its own
+ * scope's key), keeping the account's stored `accountId` / `uid`.
+ *
+ * magpie hangs a user's own name, proxy and gateway key for an account off
+ * `accountId`; rewriting it (a phone, or a domain id over the phone an older
+ * `officeace-auth` stored) would re-key the account. So a stored value stands,
+ * and one computed from the credential is only filled in when there is none —
+ * as CodeArts' own `persistCredential` does.
+ */
+async function persistOfficeAceRecord(client, cred, prev) {
+  const body = officeAceRecordBody(cred)
+  const accountId = firstOf(prev?.accountId, body.accountId)
+  const uid = firstOf(prev?.uid, body.uid)
+  const record = {
+    ...body,
+    ...(accountId ? { accountId } : {}),
+    ...(uid ? { uid } : {}),
+  }
+  try {
+    await client?.auth?.set?.({ path: { id: OFFICEACE_PROVIDER }, body: record })
+  } catch {
+    /* best effort: the next renewal writes it again */
+  }
+  return record
+}
+
+/**
+ * OfficeAce — the second provider of this package, signed in on its own card
+ * through Huawei Cloud OAuth like `codearts`, with a record and a refresh token
+ * of its own.
+ *
+ * Provider id `officeace`: the id `officeace-auth` used, so the accounts signed
+ * in through that package are read from where magpie already keeps them
+ * (`officeace`, `officeace#xxxxxx`) and nobody signs in again.
+ */
+export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
+  const fetcher = typeof options?.fetch === "function" ? options.fetch : fetch
+  const log = (message, level = "info") => {
+    try {
+      client?.app?.log?.({ service: "officeace", level, message })
+    } catch {
+      /* no log channel */
+    }
+  }
+  /** This account's credential, as either shape declares it. */
+  const credential = (auth) => officeAceCredentialOf(auth)
+  const renewNow = (cred) => renewSharedCredential(cred, () => renewOfficeAceCredential(cred, fetcher))
+
+  return {
+    // The provider and the models it shows before anyone is signed in.
+    config: async (config) => {
+      config.provider ??= {}
+      config.provider[OFFICEACE_PROVIDER] ??= {}
+      const p = config.provider[OFFICEACE_PROVIDER]
+      p.name ??= "OfficeAce"
+      p.npm ??= OFFICEACE_NPM
+      p.api ??= `${OA_MAAS_MARKET_BASE}/v2`
+      p.models = { ...officeAceStaticModels(), ...(p.models ?? {}) }
+    },
+
+    // The account's own catalog: the billable list, minus the ids that always 404.
+    provider: {
+      id: OFFICEACE_PROVIDER,
+      async models(provider, { auth } = {}) {
+        let cred = credential(auth)
+        if (!cred) {
+          // No account of its own: nothing is adopted here. An OfficeAce record
+          // is only ever written by this card's own sign-in — an account the
+          // user signed out of must not come back on the next listing.
+          noteProviderEmpty(OFFICEACE_PROVIDER)
+          return provider.models
+        }
+        const identity = accountIdentityOf(cred).id
+        if (identity) noteProviderAccount(OFFICEACE_PROVIDER, identity)
+
+        if (!cred.model_app_key) {
+          const healed = await withOfficeAceMaas(cred, fetcher)
+          if (healed.model_app_key) cred = healed
+        }
+        // The catalog and chat are behind the MaaS appKey; without it the
+        // static table is all there is (and it is honest: nobody knows yet).
+        if (!cred.model_app_key) return provider.models
+
+        const base = officeAceMaasBase(cred)
+        try {
+          const rows = await fetchOfficeAceCatalog(cred, fetcher)
+          if (!rows.length) return provider.models
+          let rates = null
+          try {
+            rates = await fetchOfficeAceTokenRates(cred, fetcher)
+          } catch {
+            rates = null
+          }
+          // An empty rates table means "never read", not "no model is billable":
+          // fall back to the static table rather than the registry's 26 ids, 19
+          // of which the user can select and then only fail at chat.
+          if (!rates || rates.size === 0) {
+            log("倍率表不可用（空表）—— 目录降级为静态表，不列出注册表占位 id", "warn")
+            return provider.models
+          }
+          const live = officeAceLiveModels(rows, base, rates)
+          if (Object.keys(live).length === 0) {
+            log("倍率表与模型目录零交集 —— 退回静态表", "warn")
+            return provider.models
+          }
+          return live
+        } catch (e) {
+          log(`目录拉取失败，回退静态表：${e?.message ?? e}`, "warn")
+          if (/401|403|unauthorized|被拒/i.test(String(e?.message))) {
+            throw Object.assign(new Error("OfficeAce 登录已失效，请重新登录"), { signIn: "expired" })
+          }
+          return provider.models
+        }
+      },
+    },
+
+    auth: {
+      provider: OFFICEACE_PROVIDER,
+      icon: OFFICEACE_ICON,
+      maxConcurrency: 3,
+      refreshLead: OA_REFRESH_LEAD_MS,
+
+      methods: [
+        {
+          type: "oauth",
+          label: "Sign in with Huawei Cloud",
+          /**
+           * A sign-in of this card's own, not the CodeArts card's: the STS
+           * triple it yields signs both vendors' APIs (measured), but a Huawei
+           * Cloud refresh token is spent once, so a second record holding this
+           * one would sign this card out at its renewal (`STS5.1806`).
+           *
+           * `authorize()` returns at once; the waiting happens in `callback()`.
+           */
+          async authorize() {
+            const flow = await startOAuthFlow(fetcher, "OfficeAce")
+            return {
+              url: flow.loginUrl,
+              instructions:
+                "Sign in to Huawei Cloud in the browser. This signs in OfficeAce only — the CodeArts card has its own sign-in. This window closes itself when done.",
+              method: "auto",
+              async callback() {
+                try {
+                  const outcome = await flow.result
+                  const cred = safeJson(outcome.access)
+                  if (!cred?.access_key_id) {
+                    return { type: "failed", error: "Huawei Cloud did not return a credential" }
+                  }
+                  // The card's name (its phone), and OfficeAce's MaaS credentials.
+                  const identified = { ...cred, ...(await accountPhoneField(cred, fetcher)) }
+                  const withMaas = await withOfficeAceMaas(identified, fetcher)
+                  // This sign-in writes this card's record only — the two cards
+                  // never share a refresh token, which is spent once.
+                  await writeProviderRecord(client, OFFICEACE_PROVIDER, withMaas, fetcher)
+                  return { ...officeAceRecordBody(withMaas), type: "success" }
+                } catch (e) {
+                  return { type: "failed", error: e?.message ?? String(e) }
+                } finally {
+                  await flow.close()
+                }
+              },
+            }
+          },
+        },
+      ],
+
+      /** Renew this account's credential — this card's record only. */
+      async refresh(auth) {
+        const cred = credential(auth)
+        if (!cred) return undefined
+        const next = await renewNow(cred)
+        if (!next) return undefined
+        const body = officeAceRecordBody(next)
+        // magpie merges this into the stored record. `accountId` is what the
+        // user's own name, proxy and gateway key for the account hang off, so a
+        // renewal never renames one: a stored value stands (phone or domain id,
+        // as `officeace-auth` wrote it), and one is only filled in when missing.
+        return {
+          access: body.access,
+          refresh: body.refresh,
+          expires: body.expires,
+          ...(auth.accountId || !body.accountId ? {} : { accountId: body.accountId }),
+          ...(auth.uid || !body.uid ? {} : { uid: body.uid }),
+        }
+      },
+
+      /** Rewrite Bearer to Basic, strip the provider prefix, renew once on a 401. */
+      async loader(getAuth) {
+        const stored = await getAuth()
+        let cred = credential(stored)
+        if (!cred) return {}
+        const identity = accountIdentityOf(cred).id
+        if (identity) noteProviderAccount(OFFICEACE_PROVIDER, identity)
+
+        if (!cred.model_app_key) {
+          const healed = await withOfficeAceMaas(cred, fetcher)
+          if (healed.model_app_key) {
+            cred = healed
+            await persistOfficeAceRecord(client, cred, stored)
+          }
+        }
+        // Signed in, but MaaS was never opened for this account: say so instead
+        // of sending an empty Basic header upstream (a 400 that reads like a
+        // broken model). Usage and the check-in work off the STS triple alone.
+        if (!cred.model_app_key) {
+          return {
+            async fetch() {
+              return Response.json(
+                {
+                  error: {
+                    message:
+                      "OfficeAce 账号已登录，但还没有接入华为云 MaaS（凭据里没有 modelAppKey）。" +
+                      "请在 OfficeAce 客户端完成「接入华为云 MaaS 模型」后重试；额度与签到不受影响，已经可以正常使用。",
+                    type: "officeace_maas_not_linked",
+                    code: "MaaSNotLinked",
+                  },
+                },
+                { status: 400, headers: { "content-type": "application/json" } },
+              )
+            },
+          }
+        }
+
+        return {
+          // Empty: the URL is built from the credential's own MaaS base.
+          baseURL: "",
+          apiKey: "",
+          async fetch(input, init) {
+            const freshRecord = await getAuth().catch(() => null)
+            const fresh = credential(freshRecord) ?? cred
+            return officeAceChatFetch({
+              input,
+              init,
+              credential: fresh,
+              fetcher,
+              renew: async () => {
+                try {
+                  const next = await renewNow(fresh)
+                  if (next) {
+                    await persistOfficeAceRecord(client, next, freshRecord ?? stored)
+                  }
+                  return next
+                } catch (e) {
+                  log(`续期失败：${e?.message ?? e}`, "warn")
+                  return undefined
+                }
+              },
+            })
+          },
+        }
+      },
+
+      /** The subscription's buckets: plan quotas and activity bonuses. */
+      async usage(getAuth) {
+        const cred = credential(await getAuth())
+        if (!cred) return { error: "未登录", windows: [] }
+        try {
+          const u = await fetchOfficeAceUsage(cred, fetcher)
+          // The phone is a display name, so it goes here only — never into the
+          // record's `accountId` (see officeAceIdentityOf).
+          const user = firstOf(cred.user_phone, officeAceIdentityOf(cred).accountId)
+          return {
+            plan: u.plan || "OfficeAce",
+            ...(user ? { user } : {}),
+            windows: u.windows,
+          }
+        } catch (e) {
+          return { error: String(e?.message ?? e).slice(0, 300), windows: [] }
+        }
+      },
+
+      /** The daily claim; claiming twice is idempotent (a 2xx with no skus is `done`). */
+      async checkin(getAuth) {
+        const stored = await getAuth()
+        const cred = credential(stored)
+        if (!cred) return { outcome: "failed", message: "未登录" }
+        try {
+          let use = cred
+          if (nearOfficeAceExpiry(cred) && cred.refresh_token) {
+            try {
+              use = (await renewNow(cred)) ?? cred
+              if (use !== cred) await persistOfficeAceRecord(client, use, stored)
+            } catch {
+              /* try with what is stored */
+            }
+          }
+          const result = await officeAceCheckin(use, fetcher)
+          if (result.outcome === "claimed") log(`签到：${result.message ?? "已领取"}`)
+          return result
+        } catch (e) {
+          return { outcome: "failed", message: String(e?.message ?? e).slice(0, 300) }
+        }
+      },
+    },
+
+    /** Per-request header: the same conversation keeps one upstream session. */
+    "chat.headers": async (input, output) => {
+      const id = input?.model?.providerID ?? input?.provider?.info?.id
+      if (id !== OFFICEACE_PROVIDER || !input?.sessionID) return
+      output.headers["x-officeace-session"] = String(input.sessionID).slice(0, 128)
+    },
+  }
+}
+
+// for tests (never a plugin: magpie only calls exported functions)
+export const _officeace = {
+  OFFICEACE_PROVIDER, OA_FALLBACK_MODELS, OA_UNAVAILABLE_IDS, OA_MAAS_MARKET_BASE,
+  OA_SUBSCRIPTION_BASE, OA_CLAW_BASE, OA_PERMISSION_PATH, OA_TOKEN_RATES_PATH,
+  officeAceCredentialOf, officeAceCredentialRecord, officeAceRecordBody, codeArtsRecordBody,
+  officeAceIdentityOf, officeAceMaasBase, officeAceModelEntry, officeAceStaticModels,
+  officeAceLiveModels, fetchOfficeAceUsage, officeAceCheckin, officeAceStripPrefix,
+  officeAceChatFetch, officeAceDiagnose, isOfficeAceBasicRejection, oaBasicFingerprint,
+  fetchOfficeAceTokenRates, fetchOfficeAceCatalog, fetchOfficeAceMaasInfo, officeAceMaasInfo,
+  signOfficeAceV11, oaSdkDate, officeAceSigned, basicAuthorization, isCodeArtsClient,
+  renewOfficeAceCredential, renewSharedCredential, nearOfficeAceExpiry,
+  accountKeySuffix, recordKeyFor, writeProviderRecord,
+  refreshClientOf, refreshChainOf, refreshLineages, lineageOf, linkRotation, rememberLineage,
+  noteProviderAccount, noteProviderEmpty, seenProviderAccounts,
+  renewalGates, withOfficeAceMaas, persistOfficeAceRecord,
+  OFFICEACE_ICON,
+}
+
+

@@ -99,6 +99,7 @@ const SNAPSHOT = [
 ]
 
 const familiesOf = (rows) => rows.map(([uid, label, aliases, vs]) => ({ uid, label, aliases, models: vs.map(([id, name, context, output]) => ({ id, name, context, output })) }))
+const SNAPSHOT_FAMILIES = familiesOf(SNAPSHOT)
 
 // parseFamilies reads `devin models list --format json`.
 function parseFamilies(text) {
@@ -174,11 +175,28 @@ const efforts = (f, tier) => {
 
 const tiers = (f) => TIERS.map(([w]) => w).filter((t) => Object.keys(byLevel(f, t)).length > 0)
 
+// suffixed is whether an id is another variant's with a word after its
+// effort that is no tier: SWE-2's swe-2-medium-lightning, which Devin
+// lists at the High cost tier beside the free swe-2-medium (2026-10-15).
+function suffixed(id) {
+  const i = id.lastIndexOf("-")
+  if (i < 0) return false
+  const word = id.slice(i + 1).toLowerCase()
+  return !TIERS.some(([w]) => w === word) && levelOf(id.slice(0, i)) !== ""
+}
+
+// defaultModel is the variant a family's id asks for when no effort is
+// asked: its first that isn't suffixed, as the first Devin lists may be a
+// paid -lightning one; the first when all are.
+function defaultModel(f) {
+  return f.models.find((m) => !suffixed(m.id)) ?? f.models[0]
+}
+
 // defaultLevel is the effort of the variant the family's id asks for when
-// none is asked (its first), medium when that names none.
+// none is asked (defaultModel), medium when that names none.
 function defaultLevel(f) {
   if (f.models.length) {
-    const [t, l] = tierOf(f.models[0].id)
+    const [t, l] = tierOf(defaultModel(f).id)
     if (!t && l) return l
   }
   return "medium"
@@ -202,7 +220,10 @@ function nearest(want, levels) {
 // newest model, which the API takes only as one of its variants — the one
 // at the effort asked for, or the nearest the family has; with none asked,
 // the family's default. A family's fast run is its fast variant at that
-// effort. Any other id (a variant's own) goes as it is.
+// effort. A family the account's list doesn't name (picked from SNAPSHOT's
+// list, which OpenCode's config offers) is SNAPSHOT's family, so swe-2
+// goes as swe-2-high, never as the bare family id Devin takes as no
+// model. Any other id (a variant's own) goes as it is.
 function variantFor(families, model, effort) {
   for (const f of families) {
     if (!named(f, model) || !f.models.length) continue
@@ -210,7 +231,7 @@ function variantFor(families, model, effort) {
       const id = byLevel(f, "")[nearest(effort, efforts(f, ""))]
       if (id) return id
     }
-    return f.models[0].id
+    return defaultModel(f).id
   }
   for (const f of families)
     for (const tier of tiers(f)) {
@@ -219,6 +240,8 @@ function variantFor(families, model, effort) {
       const levels = efforts(f, tier)
       return by[nearest(effort || defaultLevel(f), levels)] || by[levels[0]]
     }
+  if (families !== SNAPSHOT_FAMILIES && !families.some((f) => f.models.some((m) => m.id === model)))
+    return variantFor(SNAPSHOT_FAMILIES, model, effort)
   return model
 }
 
@@ -250,7 +273,7 @@ function listed(families, keep = [], images = {}, free = new Set(), prices = new
   }
   const own = (f, t) => {
     const ids = Object.values(byLevel(f, t))
-    if (!t && f.models.length && !ids.includes(f.models[0].id)) ids.push(f.models[0].id)
+    if (!t && f.models.length && !ids.includes(defaultModel(f).id)) ids.push(defaultModel(f).id)
     return ids
   }
   const out = []
@@ -445,10 +468,13 @@ const said = new Map()
 
 // configsFor is what Devin last said of key's account's models
 // ({images, families}, each null until it has said); with wait false, a
-// first ask isn't waited for.
+// first ask isn't waited for. A failed ask keeps what was said before and
+// is asked again after RETRY; its reason is kept (error) and logged once
+// when the asks start failing, so a list or free models that never come
+// say why (usage shows it too).
 async function configsFor(key, server, wait = true) {
   let c = said.get(key)
-  if (!c) said.set(key, (c = { images: null, families: null, free: new Set(), prices: new Map(), at: 0, failed: 0, asking: null }))
+  if (!c) said.set(key, (c = { images: null, families: null, free: new Set(), prices: new Map(), at: 0, failed: 0, error: "", asking: null }))
   const ask = () =>
     (c.asking ??= (async () => {
       try {
@@ -463,9 +489,11 @@ async function configsFor(key, server, wait = true) {
         const images = parseModelConfigs(b)
         if (!images) throw new Error("GetCliModelConfigs: no models")
         const families = parseConfigFamilies(b)
-        Object.assign(c, { images, families: families.length ? families : null, free: parseFree(b), prices: parsePrices(b), at: Date.now(), failed: 0 })
-      } catch {
-        c.failed = Date.now()
+        Object.assign(c, { images, families: families.length ? families : null, free: parseFree(b), prices: parsePrices(b), at: Date.now(), failed: 0, error: "" })
+      } catch (e) {
+        const why = e?.message || String(e)
+        if (!c.error) console.error(`devin: GetCliModelConfigs failed (${why}); ${c.images ? "the last list is kept" : "the free models and the account's own list are unknown"}, asked again every ${RETRY / 1000}s`)
+        Object.assign(c, { failed: Date.now(), error: why })
       } finally {
         c.asking = null
       }
@@ -985,7 +1013,10 @@ async function cliSignIn() {
         const c = readCredentials(await readFile(path, "utf8"))
         if (!c.windsurf_api_key) return { type: "failed", error: `Devin isn't signed in: ${path} has no key` }
         const r = await success(c.windsurf_api_key, (c.api_server_url || SERVER).replace(/\/+$/, ""))
-        r.metadata.cli = true
+        // a string: OpenCode 1 keeps an auth's metadata as strings and drops
+        // an auth.json entry with any other value, so its requests go past
+        // this fetch to BASE (a 404). live() takes it as truthy.
+        r.metadata.cli = "true"
         return r
       } catch (e) {
         return { type: "failed", error: e?.code === "ENOENT" ? "Devin isn't signed in: run `devin auth login`" : e.message }
@@ -1295,9 +1326,21 @@ const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v)
 // schema with properties is an object; an enum's type comes from its
 // values, and an enum of mixed values goes. The caller's own is never
 // changed.
+//
+// Below the root it also refuses an anyOf beside a type, which is what
+// magpie's gateway sends for a Gemini model: it writes the type the
+// branches agree on beside an anyOf that had none, so Kimi Code's Read
+// (line_offset: anyOf of two integers) and every Optional field came in
+// as {type: "integer", anyOf: [...]} and were refused (songyq26,
+// plugins#458). A oneOf beside a type, an anyOf at the root and an anyOf
+// with no type are taken, and a oneOf with no type beside nullable is
+// not, so only an anyOf beside a type is changed: its null branches
+// become nullable, one branch left of that type (or of none) is merged
+// into the schema, and two or more are sent as a oneOf (into allOf when
+// there is a oneOf already).
 function geminiSchema(s, depth = 0) {
   if (!isObj(s) || depth > 32) return s
-  const out = { ...s }
+  let out = { ...s }
   const sub = (v) => geminiSchema(v, depth + 1)
   for (const k of ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"])
     if (isObj(out[k])) out[k] = Object.fromEntries(Object.entries(out[k]).map(([n, v]) => [n, sub(v)]))
@@ -1315,6 +1358,19 @@ function geminiSchema(s, depth = 0) {
       out.anyOf = Array.isArray(out.anyOf) ? [...out.anyOf, ...branches] : branches
     }
     if (out.type === undefined) delete out.type
+  }
+  if (depth > 0 && out.type !== undefined && Array.isArray(out.anyOf)) {
+    const isNull = (b) => isObj(b) && b.type === "null"
+    const some = out.anyOf.filter((b) => !isNull(b))
+    if (some.length < out.anyOf.length) out.nullable = true
+    delete out.anyOf
+    const one = some.length === 1 && isObj(some[0]) ? some[0] : undefined
+    if (one && (one.type === undefined || one.type === out.type)) {
+      out = { ...one, ...out }
+    } else if (some.length) {
+      if (!Array.isArray(out.oneOf)) out.oneOf = some
+      else out.allOf = [...(Array.isArray(out.allOf) ? out.allOf : []), { oneOf: some }]
+    }
   }
   if (out.type === undefined && Array.isArray(out.enum)) {
     const vals = out.enum.filter((v) => v !== null)
@@ -1668,8 +1724,9 @@ async function* prepend(first, rest) {
   yield* rest
 }
 
-// complete answers a chat completion through GetChatMessage.
-async function complete({ key, server, families }, chat, signal) {
+// roundtrip sends a chat to GetChatMessage and answers with its event
+// iterator, or an error ({status, message}).
+async function roundtrip({ key, server, families }, chat, signal) {
   const uid = variantFor(families, chat.model, effortOf(chat.reasoning_effort))
   const body = frame(build(chat, uid, key))
   let res
@@ -1681,12 +1738,9 @@ async function complete({ key, server, families }, chat, signal) {
       signal,
     })
   } catch (e) {
-    return errorResponse({ status: 502, message: e.message })
+    return { status: 502, message: e.message }
   }
-  if (!res.ok) {
-    const e = failure(res.status, (await res.text()).slice(0, 1 << 20))
-    return errorResponse(e)
-  }
+  if (!res.ok) return failure(res.status, (await res.text()).slice(0, 1 << 20))
   // an error comes as the stream's end, before anything else: read that
   // far so it is answered with its own status
   const fr = frames(res.body)
@@ -1694,22 +1748,29 @@ async function complete({ key, server, families }, chat, signal) {
   try {
     first = await fr.next()
   } catch (e) {
-    return errorResponse({ status: 502, message: "the reply broke off: " + e.message })
+    return { status: 502, message: "the reply broke off: " + e.message }
   }
-  if (first.done) return errorResponse({ status: 502, message: "the reply broke off: EOF" })
+  if (first.done) return { status: 502, message: "the reply broke off: EOF" }
   if (first.value.end) {
     const e = failure(200, dec.decode(first.value.data))
-    return errorResponse(e.status < 300 ? { status: 502, message: "an empty reply" } : e)
+    return e.status < 300 ? { status: 502, message: "an empty reply" } : e
   }
   // 先等到实际内容或错误，才能让网关在空回复时切换渠道。
   const source = events(prepend(first.value, fr))
   const head = await source.next()
-  if (head.done) return errorResponse({ status: 502, message: "an empty reply" })
+  if (head.done) return { status: 502, message: "an empty reply" }
   if (head.value.error) {
     await fr.return?.()
-    return errorResponse(head.value.error)
+    return head.value.error
   }
-  const it = prepend(head.value, source)
+  return { it: prepend(head.value, source) }
+}
+
+// complete answers a chat completion through GetChatMessage.
+async function complete({ key, server, families }, chat, signal) {
+  const rt = await roundtrip({ key, server, families }, chat, signal)
+  if (!rt.it) return errorResponse(rt)
+  const it = rt.it
   const id = "chatcmpl-" + randomBytes(12).toString("hex")
   const created = Math.floor(Date.now() / 1000)
 
@@ -1764,6 +1825,485 @@ async function complete({ key, server, families }, chat, signal) {
   return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Magpie-Sign-In": "kept" } })
 }
 
+// ---- OpenCode 2 ----------------------------------------------------------------------
+
+// OpenCode 2 asks for a default export with an id and a setup(ctx). The
+// sign-in becomes an integration's oauth methods, the provider and its
+// static model list a provider transform, the account's own list a model
+// transform, and the custom fetch an "sdk" hook that hands the runtime a
+// LanguageModelV3 talking GetChatMessage. A v1 host calls server(), a v2
+// host setup(); each wraps the same code. @opencode/plugin is only types
+// and a define() that returns its argument, so the shape is spelled out
+// here and the package keeps no dependency.
+
+// v2Auth is the v1 auth object a v2 credential answers for live(): {type:
+// "api", key, metadata}. OAuth credentials carry the key in access, key
+// credentials in key; the CLI-sourced one keeps cli in its metadata.
+function v2Auth(value) {
+  if (value?.type === "oauth") return { type: "api", key: value.access, metadata: value.metadata ?? {} }
+  if (value?.type === "key") return { type: "api", key: value.key, metadata: value.metadata ?? {} }
+  return null
+}
+
+// v2Credential is the credential a v1 sign-in's success becomes: an OAuth
+// one (its access the session token, never expiring, the account's name
+// and plan in metadata as the v1 auth saved them).
+function v2Credential(methodID, r) {
+  return { type: "oauth", methodID, refresh: "", access: r.key, expires: 0, metadata: r.metadata }
+}
+
+// v2Chat is the chat completion a LanguageModelV3 call becomes: system
+// messages as system, an assistant's tool calls as tool_calls with the
+// call's input as its arguments JSON, a tool message of the results that
+// follow the calls they answer. A result's own content parts go as its
+// text; its images go with the next user message, as Devin's tool message
+// is text only.
+function v2Chat(options, modelID) {
+  const messages = []
+  // images a tool result carried, headed into the user message that follows
+  // them (Devin's tool message is text only)
+  let pending = []
+  const flush = (content) => {
+    if (!pending.length) return
+    content.push(...pending)
+    pending = []
+  }
+  for (const m of options.prompt ?? []) {
+    if (m.role === "system") {
+      messages.push({ role: "system", content: m.content })
+      continue
+    }
+    if (m.role === "assistant") {
+      let text = ""
+      const calls = []
+      for (const p of m.content ?? []) {
+        if (p.type === "text") text += (text ? "\n\n" : "") + p.text
+        else if (p.type === "tool-call")
+          calls.push({ id: p.toolCallId, type: "function", function: { name: p.toolName, arguments: JSON.stringify(p.input ?? {}) } })
+      }
+      if (!text && !calls.length) continue
+      messages.push({ role: "assistant", content: text, ...(calls.length ? { tool_calls: calls } : {}) })
+      continue
+    }
+    if (m.role === "tool") {
+      for (const p of m.content ?? []) {
+        if (p.type !== "tool-result") continue
+        const { text, files } = v2ToolParts(p.output)
+        messages.push({ role: "tool", tool_call_id: p.toolCallId, content: text })
+        pending.push(...files)
+      }
+      continue
+    }
+    if (m.role !== "user") continue
+    const content = []
+    flush(content)
+    for (const p of m.content ?? []) {
+      if (p.type === "text") content.push({ type: "text", text: p.text })
+      else if (p.type === "file") {
+        const d = v2FileData(p)
+        if (d) content.push({ type: "image_url", image_url: { url: d } })
+      }
+    }
+    if (content.length) messages.push({ role: "user", content })
+  }
+  if (pending.length) messages.push({ role: "user", content: pending })
+  return {
+    model: modelID,
+    messages,
+    stream: true,
+    max_completion_tokens: options.maxOutputTokens,
+    temperature: options.temperature,
+    top_p: options.topP,
+    reasoning_effort: v2Effort(options),
+    response_format: v2ResponseFormat(options.responseFormat),
+    tools: (options.tools ?? [])
+      .filter((t) => t?.type === "function" && t.name)
+      .map((t) => ({ type: "function", function: { name: t.name, description: t.description ?? "", parameters: t.inputSchema } })),
+    ...(options.toolChoice?.type === "none" ? { tool_choice: "none" } : {}),
+  }
+}
+
+// v2Effort is the reasoning effort a call asks for: the variant's
+// reasoningEffort lands in providerOptions under the provider's key
+// (openai-compatible names it after the provider id).
+function v2Effort(options) {
+  for (const key of Object.keys(options.providerOptions ?? {})) {
+    const e = options.providerOptions[key]?.reasoningEffort
+    if (e) return e
+  }
+  return ""
+}
+
+// v2ToolParts is a tool result's output as the text its tool message takes
+// and the image parts it can't — those go with the next user message, the
+// way a result's images reach Devin otherwise.
+function v2ToolParts(output) {
+  if (!output || typeof output !== "object") return { text: String(output ?? ""), files: [] }
+  if (output.type === "text" || output.type === "error")
+    return { text: typeof output.value === "string" ? output.value : JSON.stringify(output.value ?? ""), files: [] }
+  if (output.type === "json") return { text: JSON.stringify(output.value ?? null), files: [] }
+  if (output.type === "content") {
+    const texts = []
+    const files = []
+    for (const p of output.value ?? []) {
+      if (p.type === "text") texts.push(p.text ?? "")
+      else if (p.mediaType?.startsWith("image/")) {
+        const d = v2FileData(p)
+        if (d) files.push({ type: "image_url", image_url: { url: d } })
+        else texts.push("[image]")
+      } else texts.push(`[${p.mediaType || "file"}]`)
+    }
+    return { text: texts.join("\n"), files }
+  }
+  return { text: JSON.stringify(output), files: [] }
+}
+
+// v2FileData is a prompt file part as a data URL, "" for one without
+// bytes.
+function v2FileData(p) {
+  const type = p.mediaType || "application/octet-stream"
+  const d = p.data
+  if (typeof d === "string") return d.startsWith("data:") || d.startsWith("http") ? d : `data:${type};base64,${d}`
+  if (d instanceof Uint8Array) return `data:${type};base64,${Buffer.from(d).toString("base64")}`
+  if (d instanceof URL) return d.href
+  return ""
+}
+
+// v2ResponseFormat is the chat's response_format for the call's.
+function v2ResponseFormat(f) {
+  if (!f || f.type === "text") return undefined
+  if (f.type === "json") return f.schema ? { type: "json_schema", json_schema: { name: f.name || "response", schema: f.schema } } : { type: "json_object" }
+  return undefined
+}
+
+function v2Usage(u = {}) {
+  const cacheRead = u.prompt_tokens_details?.cached_tokens, cacheWrite = u.prompt_tokens_details?.cache_write_tokens
+  return {
+    inputTokens: { total: u.prompt_tokens, noCache: u.prompt_tokens == null ? undefined : u.prompt_tokens - (cacheRead || 0) - (cacheWrite || 0), cacheRead, cacheWrite },
+    outputTokens: { total: u.completion_tokens, text: undefined, reasoning: undefined },
+  }
+}
+
+// devinLanguage is the LanguageModelV3 the sdk hook hands a devin model:
+// its calls go through GetChatMessage as a streamed chat completion.
+// getAuth resolves the account's key at call time so a sign-in, sign-out or
+// account switch since setup is picked up.
+function devinLanguage(modelID, getAuth) {
+  return {
+    specificationVersion: "v3",
+    provider: "devin",
+    modelId: modelID,
+    supportedUrls: {},
+    async doGenerate(options) {
+      const auth = await getAuth()
+      if (!auth?.key) throw new Error("Devin isn't signed in")
+      const { key, server } = await live(auth)
+      const families = await familiesFor(key, server)
+      const chat = v2Chat(options, modelID)
+      chat.stream = false
+      const res = await complete({ key, server, families }, chat, options.abortSignal)
+      const body = await res.json()
+      if (!res.ok) throw new Error(body?.error?.message || `Devin: ${res.status}`)
+      const msg = body.choices?.[0]?.message ?? {}
+      const content = []
+      if (msg.reasoning_content) content.push({ type: "reasoning", text: msg.reasoning_content })
+      if (msg.content) content.push({ type: "text", text: msg.content })
+      for (const c of msg.tool_calls ?? [])
+        content.push({ type: "tool-call", toolCallId: c.id, toolName: c.function?.name, input: c.function?.arguments || "{}" })
+      return {
+        content,
+        finishReason: { unified: body.choices?.[0]?.finish_reason === "tool_calls" ? "tool-calls" : body.choices?.[0]?.finish_reason === "length" ? "length" : "stop", raw: body.choices?.[0]?.finish_reason },
+        usage: v2Usage(body.usage),
+        warnings: [],
+      }
+    },
+    async doStream(options) {
+      const auth = await getAuth()
+      if (!auth?.key) throw new Error("Devin isn't signed in")
+      const { key, server } = await live(auth)
+      const families = await familiesFor(key, server)
+      const chat = v2Chat(options, modelID)
+      const rt = await roundtrip({ key, server, families }, chat, options.abortSignal)
+      if (!rt.it) throw new Error(rt.message || `Devin: ${rt.status}`)
+      const stream = new ReadableStream({
+        // the calls the reply has opened, by the index Devin gives their
+        // args; _open is the one args deltas now belong to
+        _calls: new Map(),
+        _open: -1,
+        _reasoning: false,
+        _text: false,
+        async start(ctl) {
+          ctl.enqueue({ type: "stream-start", warnings: [] })
+        },
+        // reasoning-start and text-start open on their first delta, so a turn
+        // without reasoning announces none.
+        _openReasoning(ctl) {
+          if (this._reasoning) return
+          this._reasoning = true
+          ctl.enqueue({ type: "reasoning-start", id: "r1" })
+        },
+        _openText(ctl) {
+          if (this._text) return
+          this._text = true
+          ctl.enqueue({ type: "text-start", id: "t1" })
+        },
+        _close(ctl) {
+          if (this._reasoning) ctl.enqueue({ type: "reasoning-end", id: "r1" })
+          if (this._text) ctl.enqueue({ type: "text-end", id: "t1" })
+        },
+        async pull(ctl) {
+          for (;;) {
+            const r = await rt.it.next()
+            if (r.done) {
+              this._finish(ctl)
+              return
+            }
+            const e = r.value
+            if (e.text) {
+              this._openText(ctl)
+              return ctl.enqueue({ type: "text-delta", id: "t1", delta: e.text })
+            }
+            if (e.reasoning) {
+              this._openReasoning(ctl)
+              return ctl.enqueue({ type: "reasoning-delta", id: "r1", delta: e.reasoning })
+            }
+            if (e.tool) {
+              this._open = e.tool.index
+              this._calls.set(e.tool.index, { id: e.tool.id, name: e.tool.name, input: "" })
+              ctl.enqueue({ type: "tool-input-start", id: e.tool.id, toolName: e.tool.name })
+              return
+            }
+            if (e.args) {
+              const c = this._calls.get(e.args.index ?? this._open)
+              if (!c) continue
+              c.input += e.args.text
+              ctl.enqueue({ type: "tool-input-delta", id: c.id, delta: e.args.text })
+              return
+            }
+            if (e.stop) {
+              for (const [, c] of this._calls) {
+                ctl.enqueue({ type: "tool-input-end", id: c.id })
+                ctl.enqueue({ type: "tool-call", toolCallId: c.id, toolName: c.name, input: c.input || "{}" })
+              }
+              this._calls.clear()
+              this._close(ctl)
+              ctl.enqueue({ type: "finish", finishReason: { unified: e.stop === "tool_calls" ? "tool-calls" : e.stop === "length" ? "length" : "stop", raw: e.stop }, usage: v2Usage(e.usage) })
+              ctl.close()
+              return
+            }
+            if (e.error) {
+              ctl.enqueue({ type: "error", error: new Error(e.error.message) })
+              ctl.close()
+              return
+            }
+          }
+        },
+        _finish(ctl) {
+          for (const [, c] of this._calls) {
+            ctl.enqueue({ type: "tool-input-end", id: c.id })
+            ctl.enqueue({ type: "tool-call", toolCallId: c.id, toolName: c.name, input: c.input || "{}" })
+          }
+          this._calls.clear()
+          this._close(ctl)
+          ctl.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: v2Usage() })
+          ctl.close()
+        },
+        cancel() {
+          rt.it.return?.()
+        },
+      })
+      return { stream }
+    },
+  }
+}
+
+// v2Models is a listed()'s entries as v2 Model.Info's.
+function v2Models(families, keep, images, free, prices) {
+  return listed(families, keep, images, free, prices).map((m) => ({
+    id: m.id,
+    modelID: m.id,
+    providerID: ID,
+    name: m.name,
+    capabilities: { tools: true, input: m.image ?? seesImages(m.id) ? ["text", "image"] : ["text"], output: ["text"], temperature: true },
+    variants: m.efforts.map((e) => ({ id: e, settings: { reasoningEffort: e } })),
+    time: { released: 0 },
+    cost: [{ input: m.cost?.input ?? 0, output: m.cost?.output ?? 0, cache: { read: m.cost?.cache?.read ?? 0, write: 0 } }],
+    status: "active",
+    enabled: true,
+    limit: { context: m.context, output: m.output },
+  }))
+}
+
+// connKey identifies a connection the way OpenCode does, so a refetched
+// record of the same sign-in isn't taken for a switch.
+function connKey(c) {
+  if (!c) return ""
+  return c.type === "credential" ? `credential:${c.id}` : `env:${c.name}`
+}
+
+// v2Setup is the plugin's v2 half: the integration and its sign-in
+// methods, the provider and its static list, and the sdk hook that serves
+// the account's chats through GetChatMessage.
+async function v2Setup(ctx) {
+  const source = { connection: undefined, auth: null }
+
+  await ctx.integration.transform((editor) => {
+    editor.method.update({
+      integrationID: ID,
+      method: { id: "browser", type: "oauth", label: "Devin (browser)" },
+      async authorize() {
+        const a = await browserSignIn()
+        return {
+          url: a.url,
+          instructions: a.instructions,
+          mode: "auto",
+          callback: a.callback().then((r) => {
+            if (r?.type !== "success") throw new Error(r?.error || "the sign-in failed")
+            return v2Credential("browser", r)
+          }),
+        }
+      },
+      label: (c) => c?.metadata?.email || "Devin",
+    })
+    editor.method.update({
+      integrationID: ID,
+      method: { id: "cli", type: "oauth", label: "Devin CLI's sign-in" },
+      async authorize() {
+        const a = await cliSignIn()
+        return {
+          url: "",
+          instructions: a.instructions,
+          mode: "auto",
+          callback: a.callback().then((r) => {
+            if (r?.type !== "success") throw new Error(r?.error || "the sign-in failed")
+            return v2Credential("cli", r)
+          }),
+        }
+      },
+      label: (c) => c?.metadata?.email || "Devin",
+    })
+  })
+
+  // authFor resolves the active connection's key each call, so a chat goes
+  // out on the account that is signed in when it is made, not the one setup
+  // saw: a sign-in, a sign-out or a switch of accounts is picked up without
+  // a reload.
+  const authFor = async () => {
+    const connection = await ctx.integration.connection.active(ID)
+    if (!connection) return null
+    const value = await ctx.integration.connection.resolve(connection).catch(() => null)
+    return v2Auth(value)
+  }
+
+  // The provider's list: SNAPSHOT's until the account's own arrives, then
+  // that — so a model the account lists that the snapshot never heard of is
+  // a model "opencode models" shows. The provider transform re-runs on each
+  // reload, reading whatever source.models refresh() last set.
+  await ctx.provider.transform((editor) => {
+    editor.add({
+      info: {
+        id: ID,
+        integrationID: ID,
+        name: "Devin",
+        activation: "auto",
+        // a version suffix keeps AISDKNative from rewriting the package to the
+        // native openai-compatible provider, which the sdk hook can't reach
+        package: "aisdk:@ai-sdk/openai-compatible@2.0.41",
+        settings: { baseURL: BASE },
+      },
+      models: source.models ?? v2Models(familiesOf(SNAPSHOT), [], SNAPSHOT_IMAGES),
+      sourceConnection: source.connection,
+    })
+  })
+
+  // refresh re-reads the account: a sign-in arms the sdk hook, a sign-out
+  // disarms it, and the account's own model list replaces the snapshot's.
+  // Its network asks (images, configs, families) run off the setup path.
+  let refreshing = null
+  let stale = false
+  const refresh = () => {
+    refreshing ??= (async () => {
+      try {
+        const connection = await ctx.integration.connection.active(ID)
+        source.connection = connection
+        if (!connection) {
+          source.auth = null
+          source.models = null
+          await ctx.provider.reload()
+          return
+        }
+        const value = await ctx.integration.connection.resolve(connection).catch(() => null)
+        source.auth = v2Auth(value)
+        if (!source.auth?.key) {
+          source.models = null
+          await ctx.provider.reload()
+          return
+        }
+        const { key, server } = await live(source.auth)
+        const [images, { free, prices }, families] = await Promise.all([
+          imagesFor(key, server).catch(() => null),
+          configsFor(key, server).catch(() => ({})),
+          ownFamilies(key, server).catch(() => null),
+        ])
+        source.models = v2Models(families ?? familiesOf(SNAPSHOT), [], images ?? SNAPSHOT_IMAGES, free, prices)
+        // the account may have signed out or switched while the asks ran:
+        // its list then belongs to the connection the reads answered, so
+        // drop it and take the new account's turn next.
+        if (connKey(await ctx.integration.connection.active(ID)) !== connKey(connection)) {
+          source.models = null
+          stale = true
+          return
+        }
+        await ctx.provider.reload()
+        await ctx.model.reload()
+      } finally {
+        refreshing = null
+        if (stale) {
+          stale = false
+          void refresh()
+        }
+      }
+    })()
+    return refreshing
+  }
+
+  // The models a chat is sent to Devin as, and the key it goes with. The
+  // SDK the package's own factory made is replaced wholesale: every call
+  // goes through GetChatMessage, resolving the active account at call time.
+  await ctx.aisdk.hook(
+    "sdk",
+    (evt) => {
+      if (!source.auth?.key) return
+      evt.sdk = { languageModel: (id) => devinLanguage(id, authFor) }
+    },
+    { providerID: ID },
+  )
+
+  // A sign-in, sign-out or account switch re-reads the account and reloads
+  // the provider list it publishes.
+  if (ctx.event?.subscribe)
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe())
+          if (event?.type === "credential.switched" && event?.data?.integrationID === ID) await refresh()
+      } catch {}
+    })()
+
+  // Setup registers the hooks and returns; the account's first read happens
+  // in the background so Devin being unreachable doesn't stall the host.
+  void refresh()
+}
+
+export default {
+  id: "devin",
+  async setup(ctx) {
+    await v2Setup(ctx)
+  },
+  async server(input) {
+    return DevinAuthPlugin(input)
+  },
+}
+
 // ---- the plugin ---------------------------------------------------------------------
 
 // ---- usage -----------------------------------------------------------------
@@ -1790,11 +2330,12 @@ function userStatus(key, server) {
 // built-in Devin account showed none of this. The day and the week don't
 // count the models Devin says are free (notModels): with them used up,
 // SWE-2 still answers, and magpie sends it to the account.
+const SIGNED_OUT = "Devin's sign-in has expired — sign in again"
 async function usage(key, server, onStatus) {
   const res = await userStatus(key, server)
   const text = await res.text()
   if (res.status === 401 || failure(res.status, text).status === 401)
-    return { error: "Devin's sign-in has expired — sign in again", windows: [] }
+    return { error: SIGNED_OUT, windows: [] }
   if (!res.ok) return { error: failure(res.status, text).message, windows: [] }
   const u = JSON.parse(text || "{}")?.userStatus ?? {}
   await onStatus?.(u)
@@ -1819,9 +2360,16 @@ async function usage(key, server, onStatus) {
     if (hide || ((left === undefined || left === null) && !(quota && at > 0))) continue
     out.windows.push({ name, used: Math.min(100, Math.max(0, 100 - num(left))), span, ...(at > 0 ? { resetsAt: at } : {}) })
   }
+  // with Devin's word on its models unread, which are free is unknown, so
+  // the day and the week count them all (a used-up quota then holds SWE-2
+  // too): a row says so and why, instead of nothing
   if (out.windows.length) {
     const free = await freeIDs(key, server)
     if (free.length) for (const w of out.windows) w.notModels = free
+    else {
+      const c = await configsFor(key, server)
+      if (c.error && !c.at) out.windows.push({ name: "Free models", display: "unknown: Devin's model list couldn't be read (" + c.error + ")", aside: true })
+    }
   }
   const limit = num(st.acuLimit)
   if (limit > 0) {
@@ -1928,7 +2476,11 @@ export async function DevinAuthPlugin({ client } = {}) {
             } catch {}
           }
         }
-        return { ...(await usage(key, server, syncOrg)), signIn: "kept" }
+        // a key Devin refuses marks the account signed out, so magpie
+        // passes over it and its row offers Sign in again; a clean read
+        // takes the mark off. Any other failure keeps it.
+        const u = await usage(key, server, syncOrg)
+        return { ...u, signIn: u.error === SIGNED_OUT ? "expired" : u.error ? "kept" : "renewed" }
       },
     },
     async config(config) {
@@ -1961,4 +2513,4 @@ export async function DevinAuthPlugin({ client } = {}) {
 }
 
 // for tests
-export const _internal = { parseFree, parsePrices, geminiSchema, freeIDs, outID, inID, objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, parseConfigFamilies, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoOfStatus, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames }
+export const _internal = { parseFree, parsePrices, geminiSchema, freeIDs, outID, inID, objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, parseConfigFamilies, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoOfStatus, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames, v2Chat, v2ToolParts, v2FileData, v2Effort, v2ResponseFormat, v2Usage, v2Auth, v2Credential, v2Models, devinLanguage, v2Setup, connKey }
