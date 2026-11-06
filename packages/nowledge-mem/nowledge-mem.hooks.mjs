@@ -13,15 +13,18 @@
 //    "spaceId": "", "agentId": "", "hostAgentId": "", "recall": true,
 //    "contextBundle": true, "maxMemories": 5, "maxBytes": 6000,
 //    "requestTimeoutMs": 900, "recallBackoffMs": 30000, "capture": false,
-//    "captureTools": true, "allowInsecureHttp": false}
+//    "captureTools": true, "captureFilter": "off", "captureCindy": false,
+//    "allowInsecureHttp": false, "recallRemote": false, "captureRemote": false,
+//    "skipAgents": []}
 //
 // A turn keeps the block it was given for the rest of the conversation, so what
 // the agent sends stays the same from one request to the next and the
 // provider's prompt cache keeps working. Anything that goes wrong leaves the
 // request as it came.
 import { resolve } from "node:path";
+import { captureMessage } from "./capture-filter.mjs";
 import { conversation as transcript, history, notice, open, close } from "./conversation.mjs";
-import { MemFailure as Failure, resolveOptions, request, serviceKey, sha256, trimText, utf8, version } from "./mem.mjs";
+import { MemFailure as Failure, agentKey, resolveOptions, request, serviceKey, sha256, trimText, utf8, version } from "./mem.mjs";
 const maxQuery = 2000;
 const maxMemory = 1000;
 const maxImport = 512 << 10;
@@ -63,9 +66,16 @@ export async function onRequest(body, ctx) {
 }
 async function run(body, ctx) {
     const o = resolveOptions(ctx.options);
+    // An app the user listed in skipAgents (a translator, say) gets neither
+    // recall nor capture: its requests go as they came, and Mem hears nothing.
+    const listed = o.skipAgents.has(agentKey(ctx.agent));
     const own = ctx.origin === "local" || ctx.origin === "magpie-key";
-    const recall = o.recall && own;
-    const capture = o.capture && own;
+    // Another machine, or a gateway key other than this computer's own, gets
+    // in only by the user's opt-in, one for each: permission to capture does
+    // not grant recall of what Mem holds. A missing or unknown origin never does.
+    const other = ctx.origin === "remote" || ctx.origin === "gateway-key";
+    const recall = o.recall && !listed && (own || (other && o.recallRemote));
+    const capture = o.capture && !listed && (own || (other && o.captureRemote));
     if (!recall && !capture) {
         ctx.report?.("skipped");
         return;
@@ -395,7 +405,11 @@ async function capture(reply, ctx, state) {
     // Credentials anywhere in the conversation stop the whole capture.
     if (hasSecret(captured.messages))
         return;
-    const messages = importMessages(captured.messages, state);
+    const messages = importMessages(captured.messages, state, ctx.agent);
+    if (state.o.captureFilter === "human" && !messages.some((m) => m.role === "user")) {
+        ctx.report?.("skipped");
+        return;
+    }
     if (!messages.length)
         return;
     const content = JSON.stringify(messages);
@@ -420,7 +434,11 @@ async function capture(reply, ctx, state) {
         metadata.agent = ctx.agent;
     const payload = {
         thread_id: state.threadId,
-        title: state.title || titleOf(messages),
+        // In human mode the first retained user text names the Thread, not
+        // a host preamble. Keep that title once the import is acknowledged.
+        title: state.o.captureFilter === "human"
+            ? titles.get(state.threadId) ?? titleOf(messages)
+            : state.title || titleOf(messages),
         source: "magpie",
         messages,
         metadata,
@@ -444,17 +462,23 @@ async function capture(reply, ctx, state) {
     ctx.report?.("ready", utf8(content));
 }
 // importMessages keeps what a person and the assistant wrote. Client tool
-// results follow when captureTools is on; tool-only assistant steps and our
-// own recalled blocks are not messages of the conversation.
-function importMessages(messages, state) {
+// results follow when captureTools is on and the filter is off; tool-only
+// assistant steps and our own recalled blocks are not conversation messages.
+function importMessages(messages, state, agent) {
     const out = [];
     messages.forEach((message, index) => {
-        const content = message.content.trim();
-        if (!content)
+        const projected = captureMessage(message, state.o, agent);
+        if (!projected)
             return;
-        if (!state.o.captureTools && (message.role === "tool" || message.tool_calls?.length))
+        const human = state.o.captureFilter === "human";
+        const content = human ? projected.content : projected.content.trim();
+        if (!content.trim())
             return;
-        const metadata = { external_id: `magpie:${sha256(state.threadId, String(index), message.role, content).slice(0, 24)}` };
+        if (!human && !state.o.captureTools && (message.role === "tool" || message.tool_calls?.length))
+            return;
+        // Use the original occurrence index, not the filtered array index:
+        // hash normalized source text so policy changes preserve legacy off-mode IDs.
+        const metadata = { ...projected.metadata, external_id: `magpie:${sha256(state.threadId, String(index), message.role, message.content.trim()).slice(0, 24)}` };
         if (message.role === "tool") {
             if (message.name)
                 metadata.tool_name = message.name;

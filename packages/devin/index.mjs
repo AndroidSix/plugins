@@ -17,6 +17,13 @@ import { isAbsolute, join, relative, resolve } from "node:path"
 
 const ID = "devin"
 const CHAT = "@ai-sdk/openai-compatible"
+// Devin's Claude models are asked on Anthropic's Messages API, so the
+// client's own blocks and cache marks reach the plugin as it sent them
+// (#566); every other model stays on chat completions
+const ANTHROPIC = "@ai-sdk/anthropic"
+const isClaude = (id) => /claude/i.test(String(id))
+const npmOf = (id) => (isClaude(id) ? ANTHROPIC : CHAT)
+const variantOf = (id, e) => (isClaude(id) ? { effort: e } : { reasoningEffort: e })
 
 const SERVER = "https://server.codeium.com"
 const AUTHORIZE = "https://app.devin.ai/auth/cli/continue"
@@ -34,16 +41,16 @@ const RETRY = 60 * 1000
 
 // ---- models ---------------------------------------------------------------------
 
-// Devin's list as `devin models list --format json` gave it (2026-10-14),
+// Devin's list as `devin models list --format json` gave it (2026-11-05),
 // less Adaptive and Fusion, which route between models inside Devin's own
 // agent and aren't served by the API: family id, label, aliases, and each
-// variant's id, label, context and output. Inkling and Claude Sonnet 4.5,
-// gone from that list, stay for the accounts still offered them. The
-// account's own list, from Devin (GetCliModelConfigs) or else the CLI,
-// replaces it.
+// variant's id, label, context and output. Models gone from that list —
+// Inkling, Claude Sonnet 4.5, SWE-1.7 Lightning and the rest at the end —
+// stay for the accounts still offered them. The account's own list, from
+// Devin (GetCliModelConfigs) or else the CLI, replaces it.
 const SNAPSHOT = [
   ["swe-2","SWE-2",["swe"],[["swe-2-high","SWE-2 High",262000,128000],["swe-2-medium","SWE-2 Medium",262000,128000],["swe-2-max","SWE-2 Max",262000,128000]]],
-  ["swe-1.7-lightning","SWE-1.7 Lightning",[],[["swe-1-7-lightning","SWE-1.7 Lightning Max",202752,96000],["swe-1-7-lightning-medium","SWE-1.7 Lightning Medium",202752,96000]]],
+  ["swe-2-flash","SWE-2 Flash",[],[["swe-2-flash-medium","SWE-2 Flash Medium",262144,131072],["swe-2-flash-high","SWE-2 Flash High",262144,131072],["swe-2-flash-max","SWE-2 Flash Max",262144,131072]]],
   ["claude-fable-5-1","Claude Fable 5.1",["fable"],[["claude-fable-5-1-medium","Claude Fable 5.1 Medium",1000000,128000],["claude-fable-5-1-low","Claude Fable 5.1 Low",1000000,128000],["claude-fable-5-1-high","Claude Fable 5.1 High",1000000,128000],["claude-fable-5-1-xhigh","Claude Fable 5.1 XHigh",1000000,128000],["claude-fable-5-1-max","Claude Fable 5.1 Max",1000000,128000]]],
   ["claude-opus-5-5","Claude Opus 5.5",[],[["claude-opus-5-5-medium","Claude Opus 5.5 Medium",1000000,128000],["claude-opus-5-5-low","Claude Opus 5.5 Low",1000000,128000],["claude-opus-5-5-high","Claude Opus 5.5 High",1000000,128000],["claude-opus-5-5-xhigh","Claude Opus 5.5 XHigh",1000000,128000],["claude-opus-5-5-max","Claude Opus 5.5 Max",1000000,128000],["claude-opus-5-5-low-fast","Claude Opus 5.5 Low Fast",1000000,128000],["claude-opus-5-5-medium-fast","Claude Opus 5.5 Medium Fast",1000000,128000],["claude-opus-5-5-high-fast","Claude Opus 5.5 High Fast",1000000,128000],["claude-opus-5-5-xhigh-fast","Claude Opus 5.5 XHigh Fast",1000000,128000],["claude-opus-5-5-max-fast","Claude Opus 5.5 Max Fast",1000000,128000]]],
   ["gpt-6-astra","GPT-6 Astra",[],[["gpt-6-astra-medium","GPT-6 Astra Medium Thinking",1000000,128000],["gpt-6-astra-low","GPT-6 Astra Low Thinking",1000000,128000],["gpt-6-astra-high","GPT-6 Astra High Thinking",1000000,128000],["gpt-6-astra-xhigh","GPT-6 Astra XHigh Thinking",1000000,128000],["gpt-6-astra-max","GPT-6 Astra Max Thinking",1000000,128000],["gpt-6-astra-low-priority","GPT-6 Astra Low Thinking Fast",1000000,128000],["gpt-6-astra-medium-priority","GPT-6 Astra Medium Thinking Fast",1000000,128000],["gpt-6-astra-high-priority","GPT-6 Astra High Thinking Fast",1000000,128000],["gpt-6-astra-xhigh-priority","GPT-6 Astra XHigh Thinking Fast",1000000,128000],["gpt-6-astra-max-priority","GPT-6 Astra Max Thinking Fast",1000000,128000]]],
@@ -68,19 +75,28 @@ const SNAPSHOT = [
   ["gpt-5.6-terra","GPT-5.6 Terra",[],[["gpt-5-6-terra-none","GPT-5.6 Terra No Thinking",1000000,128000],["gpt-5-6-terra-low","GPT-5.6 Terra Low Thinking",1000000,128000],["gpt-5-6-terra-medium","GPT-5.6 Terra Medium Thinking",1000000,128000],["gpt-5-6-terra-high","GPT-5.6 Terra High Thinking",1000000,128000],["gpt-5-6-terra-xhigh","GPT-5.6 Terra XHigh Thinking",1000000,128000],["gpt-5-6-terra-max","GPT-5.6 Terra Max Thinking",1000000,128000],["gpt-5-6-terra-none-priority","GPT-5.6 Terra No Thinking Fast",1000000,128000],["gpt-5-6-terra-low-priority","GPT-5.6 Terra Low Thinking Fast",1000000,128000],["gpt-5-6-terra-medium-priority","GPT-5.6 Terra Medium Thinking Fast",1000000,128000],["gpt-5-6-terra-high-priority","GPT-5.6 Terra High Thinking Fast",1000000,128000],["gpt-5-6-terra-xhigh-priority","GPT-5.6 Terra XHigh Thinking Fast",1000000,128000],["gpt-5-6-terra-max-priority","GPT-5.6 Terra Max Thinking Fast",1000000,128000]]],
   ["gpt-5.6-luna","GPT-5.6 Luna",[],[["gpt-5-6-luna-none","GPT-5.6 Luna No Thinking",1000000,128000],["gpt-5-6-luna-low","GPT-5.6 Luna Low Thinking",1000000,128000],["gpt-5-6-luna-medium","GPT-5.6 Luna Medium Thinking",1000000,128000],["gpt-5-6-luna-high","GPT-5.6 Luna High Thinking",1000000,128000],["gpt-5-6-luna-xhigh","GPT-5.6 Luna XHigh Thinking",1000000,128000],["gpt-5-6-luna-max","GPT-5.6 Luna Max Thinking",1000000,128000],["gpt-5-6-luna-none-priority","GPT-5.6 Luna No Thinking Fast",1000000,128000],["gpt-5-6-luna-low-priority","GPT-5.6 Luna Low Thinking Fast",1000000,128000],["gpt-5-6-luna-medium-priority","GPT-5.6 Luna Medium Thinking Fast",1000000,128000],["gpt-5-6-luna-high-priority","GPT-5.6 Luna High Thinking Fast",1000000,128000],["gpt-5-6-luna-xhigh-priority","GPT-5.6 Luna XHigh Thinking Fast",1000000,128000],["gpt-5-6-luna-max-priority","GPT-5.6 Luna Max Thinking Fast",1000000,128000]]],
   ["gpt-6-1-sol","GPT-6.1 Sol",[],[["gpt-6-1-sol-low","GPT-6.1 Sol Low Thinking",1000000,128000],["gpt-6-1-sol-medium","GPT-6.1 Sol Medium Thinking",1000000,128000],["gpt-6-1-sol-high","GPT-6.1 Sol High Thinking",1000000,128000],["gpt-6-1-sol-xhigh","GPT-6.1 Sol XHigh Thinking",1000000,128000],["gpt-6-1-sol-max","GPT-6.1 Sol Max Thinking",1000000,128000],["gpt-6-1-sol-low-priority","GPT-6.1 Sol Low Thinking Fast",1000000,128000],["gpt-6-1-sol-medium-priority","GPT-6.1 Sol Medium Thinking Fast",1000000,128000],["gpt-6-1-sol-high-priority","GPT-6.1 Sol High Thinking Fast",1000000,128000],["gpt-6-1-sol-xhigh-priority","GPT-6.1 Sol XHigh Thinking Fast",1000000,128000],["gpt-6-1-sol-max-priority","GPT-6.1 Sol Max Thinking Fast",1000000,128000]]],
-  ["grok-4.5","Grok 4.5",[],[["grok-4-5-low","Grok 4.5 Low",500000,100000],["grok-4-5-medium","Grok 4.5 Medium",500000,100000],["grok-4-5-high","Grok 4.5 High",500000,100000]]],
+  ["gpt-6-1-terra","GPT-6.1 Terra",[],[["gpt-6-1-terra-low","GPT-6.1 Terra Low Thinking",1000000,128000],["gpt-6-1-terra-medium","GPT-6.1 Terra Medium Thinking",1000000,128000],["gpt-6-1-terra-high","GPT-6.1 Terra High Thinking",1000000,128000],["gpt-6-1-terra-xhigh","GPT-6.1 Terra XHigh Thinking",1000000,128000],["gpt-6-1-terra-max","GPT-6.1 Terra Max Thinking",1000000,128000],["gpt-6-1-terra-low-priority","GPT-6.1 Terra Low Thinking Fast",1000000,128000],["gpt-6-1-terra-medium-priority","GPT-6.1 Terra Medium Thinking Fast",1000000,128000],["gpt-6-1-terra-high-priority","GPT-6.1 Terra High Thinking Fast",1000000,128000],["gpt-6-1-terra-xhigh-priority","GPT-6.1 Terra XHigh Thinking Fast",1000000,128000],["gpt-6-1-terra-max-priority","GPT-6.1 Terra Max Thinking Fast",1000000,128000]]],
   ["grok-4-6","Grok 4.6",[],[["grok-4-6-low","Grok 4.6 Low",500000,100000],["grok-4-6-medium","Grok 4.6 Medium",500000,100000],["grok-4-6-high","Grok 4.6 High",500000,100000],["grok-4-6-xhigh","Grok 4.6 XHigh",500000,100000]]],
   ["grok-4-7","Grok 4.7",[],[["grok-4-7-low","Grok 4.7 Low",500000,100000],["grok-4-7-medium","Grok 4.7 Medium",500000,100000],["grok-4-7-high","Grok 4.7 High",500000,100000],["grok-4-7-xhigh","Grok 4.7 XHigh",500000,100000]]],
-  ["inkling","Inkling",[],[["inkling-none","Inkling None",1048576,131072],["inkling-low","Inkling Low",1048576,131072],["inkling-medium","Inkling Medium",1048576,131072],["inkling-high","Inkling High",1048576,131072],["inkling-xhigh","Inkling X-High",1048576,131072],["inkling-max","Inkling Max",1048576,131072]]],
-  ["glm-5-3-flash","GLM-5.3 Flash",[],[["glm-5-3-flash-low","GLM-5.3 Flash Low",1000000,128000],["glm-5-3-flash-high","GLM-5.3 Flash High",1000000,128000],["glm-5-3-flash-max","GLM-5.3 Flash Max",1000000,128000]]],
+  ["muse-wonder-1-0","Muse Wonder",[],[["muse-wonder-1-0-minimal","Muse Wonder Minimal",1048576,131072],["muse-wonder-1-0-low","Muse Wonder Low",1048576,131072],["muse-wonder-1-0-medium","Muse Wonder Medium",1048576,131072],["muse-wonder-1-0-high","Muse Wonder High",1048576,131072],["muse-wonder-1-0-xhigh","Muse Wonder XHigh",1048576,131072],["muse-wonder-1-0-max","Muse Wonder Max",1048576,131072]]],
+  ["nemotron-3-5-super","Nemotron 3.5 Super",[],[["nemotron-3-5-super-none","Nemotron 3.5 Super None",1048576,65536],["nemotron-3-5-super-medium","Nemotron 3.5 Super Medium",1048576,65536],["nemotron-3-5-super-high","Nemotron 3.5 Super High",1048576,65536]]],
+  ["glm-5-3-flash","GLM-5.3 Flash",[],[["glm-5-3-flash-low","GLM-5.3 Flash Low",1000000,131072],["glm-5-3-flash-high","GLM-5.3 Flash High",1000000,131072],["glm-5-3-flash-max","GLM-5.3 Flash Max",1000000,131072]]],
   ["deepseek-v4-flash","DeepSeek V4 Flash",[],[["deepseek-v4-flash-high","DeepSeek V4 Flash High",1048576,384000],["deepseek-v4-flash-max","DeepSeek V4 Flash Max",1048576,384000]]],
-  ["deepseek-v4-1-flash","DeepSeek V4.1 Flash",[],[["deepseek-v4-1-flash-high","DeepSeek V4.1 Flash High",1048576,384000],["deepseek-v4-1-flash-max","DeepSeek V4.1 Flash Max",1048576,384000]]],
+  ["deepseek-v4-1-flash-1017","DeepSeek V4.1 Flash",[],[["deepseek-v4-1-flash-1017-none","DeepSeek V4.1 Flash None",1048576,384000],["deepseek-v4-1-flash-1017-low","DeepSeek V4.1 Flash Low",1048576,384000],["deepseek-v4-1-flash-1017-high","DeepSeek V4.1 Flash High",1048576,384000],["deepseek-v4-1-flash-1017-max","DeepSeek V4.1 Flash Max",1048576,384000]]],
   ["swe-1.7","SWE-1.7",[],[["swe-1-7","SWE-1.7 Max",262000,128000],["swe-1-7-medium","SWE-1.7 Medium",262000,128000]]],
   ["claude-opus-4.6","Claude Opus 4.6",[],[["claude-opus-4-6","Claude Opus 4.6",200000,128000],["claude-opus-4-6-thinking","Claude Opus 4.6 Thinking",200000,128000],["claude-opus-4-6-1m","Claude Opus 4.6 1M",1000000,128000],["claude-opus-4-6-thinking-1m","Claude Opus 4.6 Thinking 1M",1000000,128000]]],
   ["gpt-5.4","GPT-5.4",[],[["gpt-5-4-none","GPT-5.4 No Thinking",272000,128000],["gpt-5-4-low","GPT-5.4 Low Thinking",272000,128000],["gpt-5-4-medium","GPT-5.4 Medium Thinking",272000,128000],["gpt-5-4-high","GPT-5.4 High Thinking",272000,128000],["gpt-5-4-xhigh","GPT-5.4 XHigh Thinking",272000,128000],["gpt-5-4-none-priority","GPT-5.4 No Thinking Fast",272000,128000],["gpt-5-4-low-priority","GPT-5.4 Low Thinking Fast",272000,128000],["gpt-5-4-medium-priority","GPT-5.4 Medium Thinking Fast",272000,128000],["gpt-5-4-high-priority","GPT-5.4 High Thinking Fast",272000,128000],["gpt-5-4-xhigh-priority","GPT-5.4 XHigh Thinking Fast",272000,128000]]],
   ["gpt-5.5","GPT-5.5",["gpt"],[["gpt-5-5-none","GPT-5.5 No Thinking",272000,128000],["gpt-5-5-low","GPT-5.5 Low Thinking",272000,128000],["gpt-5-5-medium","GPT-5.5 Medium Thinking",272000,128000],["gpt-5-5-high","GPT-5.5 High Thinking",272000,128000],["gpt-5-5-xhigh","GPT-5.5 XHigh Thinking",272000,128000],["gpt-5-5-none-priority","GPT-5.5 No Thinking Fast",272000,128000],["gpt-5-5-low-priority","GPT-5.5 Low Thinking Fast",272000,128000],["gpt-5-5-medium-priority","GPT-5.5 Medium Thinking Fast",272000,128000],["gpt-5-5-high-priority","GPT-5.5 High Thinking Fast",272000,128000],["gpt-5-5-xhigh-priority","GPT-5.5 XHigh Thinking Fast",272000,128000]]],
   ["gpt-5.4-mini","GPT-5.4 Mini",[],[["gpt-5-4-mini-low","GPT-5.4 Mini Low Thinking",400000,128000],["gpt-5-4-mini-medium","GPT-5.4 Mini Medium Thinking",400000,128000],["gpt-5-4-mini-high","GPT-5.4 Mini High Thinking",400000,128000],["gpt-5-4-mini-xhigh","GPT-5.4 Mini XHigh Thinking",400000,128000]]],
   ["claude-sonnet-4.6","Claude Sonnet 4.6",[],[["claude-sonnet-4-6","Claude Sonnet 4.6",200000,128000],["claude-sonnet-4-6-thinking","Claude Sonnet 4.6 Thinking",200000,128000],["claude-sonnet-4-6-1m","Claude Sonnet 4.6 1M",1000000,128000],["claude-sonnet-4-6-thinking-1m","Claude Sonnet 4.6 Thinking 1M",1000000,128000]]],
+  ["kimi-k2.6","Kimi K2.6",[],[["kimi-k2-6","Kimi K2.6",262144,8192]]],
+  ["kimi-k2.7","Kimi K2.7",[],[["kimi-k2-7","Kimi K2.7",262144,16000]]],
+  ["nemotron-3-ultra","Nemotron 3 Ultra",[],[["nemotron-3-ultra-none","Nemotron 3 Ultra None",1000000,32768],["nemotron-3-ultra-medium","Nemotron 3 Ultra Medium",1000000,32768],["nemotron-3-ultra-high","Nemotron 3 Ultra High",1000000,32768]]],
+  ["swe-1.6","SWE-1.6",[],[["swe-1-6","SWE-1.6",200000,128000]]],
+  ["deepseek-v4-pro","DeepSeek V4 Pro",[],[["deepseek-v4-pro-high","DeepSeek V4 Pro High",1048576,384000],["deepseek-v4-pro-max","DeepSeek V4 Pro Max",1048576,384000]]],
+  ["swe-1.7-lightning","SWE-1.7 Lightning",[],[["swe-1-7-lightning","SWE-1.7 Lightning Max",202752,96000],["swe-1-7-lightning-medium","SWE-1.7 Lightning Medium",202752,96000]]],
+  ["inkling","Inkling",[],[["inkling-none","Inkling None",1048576,131072],["inkling-low","Inkling Low",1048576,131072],["inkling-medium","Inkling Medium",1048576,131072],["inkling-high","Inkling High",1048576,131072],["inkling-xhigh","Inkling X-High",1048576,131072],["inkling-max","Inkling Max",1048576,131072]]],
+  ["grok-4.5","Grok 4.5",[],[["grok-4-5-low","Grok 4.5 Low",500000,100000],["grok-4-5-medium","Grok 4.5 Medium",500000,100000],["grok-4-5-high","Grok 4.5 High",500000,100000]]],
   ["gpt-5.2","GPT-5.2",[],[["MODEL_GPT_5_2_LOW","GPT-5.2 Low Thinking",384000,128000],["MODEL_GPT_5_2_MEDIUM","GPT-5.2 Medium Thinking",384000,128000],["MODEL_GPT_5_2_NONE","GPT-5.2 No Thinking",384000,128000],["MODEL_GPT_5_2_HIGH","GPT-5.2 High Thinking",384000,128000],["MODEL_GPT_5_2_XHIGH","GPT-5.2 XHigh Thinking",384000,128000]]],
   ["claude-opus-4.5","Claude Opus 4.5",[],[["MODEL_CLAUDE_4_5_OPUS","Claude Opus 4.5",200000,64000],["MODEL_CLAUDE_4_5_OPUS_THINKING","Claude Opus 4.5 Thinking",200000,64000]]],
   ["Claude Haiku 4.5","Claude Haiku 4.5",[],[["MODEL_PRIVATE_11","Claude Haiku 4.5",200000,64000]]],
@@ -88,14 +104,9 @@ const SNAPSHOT = [
   ["GPT-4.1","GPT-4.1",[],[["MODEL_CHAT_GPT_4_1_2025_04_14","GPT-4.1",1047576,32768]]],
   ["gpt-5.1","GPT-5.1",[],[["MODEL_PRIVATE_12","GPT-5.1 No Thinking",272000,128000],["MODEL_PRIVATE_13","GPT-5.1 Low Thinking",272000,128000],["MODEL_PRIVATE_14","GPT-5.1 Medium Thinking",272000,128000],["MODEL_PRIVATE_15","GPT-5.1 High Thinking",272000,128000]]],
   ["gpt-5.3-codex","GPT-5.3-Codex",["codex"],[["gpt-5-3-codex-low","GPT-5.3-Codex Low",400000,128000],["gpt-5-3-codex-medium","GPT-5.3-Codex Medium",400000,128000],["gpt-5-3-codex-high","GPT-5.3-Codex High",400000,128000],["gpt-5-3-codex-xhigh","GPT-5.3-Codex X-High",400000,128000],["gpt-5-3-codex-low-priority","GPT-5.3-Codex Low Fast",400000,128000],["gpt-5-3-codex-medium-priority","GPT-5.3-Codex Medium Fast",400000,128000],["gpt-5-3-codex-high-priority","GPT-5.3-Codex High Fast",400000,128000],["gpt-5-3-codex-xhigh-priority","GPT-5.3-Codex XHigh Fast",400000,128000]]],
-  ["kimi-k2.6","Kimi K2.6",[],[["kimi-k2-6","Kimi K2.6",262144,8192]]],
-  ["kimi-k2.7","Kimi K2.7",[],[["kimi-k2-7","Kimi K2.7",262144,16000]]],
-  ["nemotron-3-ultra","Nemotron 3 Ultra",[],[["nemotron-3-ultra-none","Nemotron 3 Ultra None",1000000,32768],["nemotron-3-ultra-medium","Nemotron 3 Ultra Medium",1000000,32768],["nemotron-3-ultra-high","Nemotron 3 Ultra High",1000000,32768]]],
-  ["swe-1.6","SWE-1.6",[],[["swe-1-6","SWE-1.6",200000,128000]]],
   ["swe-1.6-fast","SWE-1.6 Fast",[],[["swe-1-6-fast","SWE-1.6 Fast",200000,128000]]],
   ["gemini-3.1-pro","Gemini 3.1 Pro",[],[["gemini-3-1-pro-low","Gemini 3.1 Pro Low Thinking",1048576,65535],["gemini-3-1-pro-high","Gemini 3.1 Pro High Thinking",1048576,65535]]],
   ["gemini-3.0-flash","Gemini 3 Flash",[],[["MODEL_GOOGLE_GEMINI_3_0_FLASH_MINIMAL","Gemini 3 Flash Minimal",1048576,65535],["MODEL_GOOGLE_GEMINI_3_0_FLASH_LOW","Gemini 3 Flash Low",1048576,65535],["MODEL_GOOGLE_GEMINI_3_0_FLASH_MEDIUM","Gemini 3 Flash Medium",1048576,65535],["MODEL_GOOGLE_GEMINI_3_0_FLASH_HIGH","Gemini 3 Flash High",1048576,65535]]],
-  ["deepseek-v4-pro","DeepSeek V4 Pro",[],[["deepseek-v4-pro-high","DeepSeek V4 Pro High",1048576,384000],["deepseek-v4-pro-max","DeepSeek V4 Pro Max",1048576,384000]]],
 ]
 
 const familiesOf = (rows) => rows.map(([uid, label, aliases, vs]) => ({ uid, label, aliases, models: vs.map(([id, name, context, output]) => ({ id, name, context, output })) }))
@@ -327,7 +338,7 @@ function familyImages(f, images) {
 // magpie's built-in asks it (devin_images.go): `devin models list` says
 // nothing of images and models.dev doesn't know Devin's own ids, so swe-2
 // was said to take none and agents dropped its images (面条 on magpie's
-// Discord). NO_IMAGES are the ids Devin said take none, as of 2026-10-05;
+// Discord). NO_IMAGES are the ids Devin said take none, as of 2026-11-05;
 // every other id in SNAPSHOT takes them, which is what a list is told
 // before Devin is asked, or when it can't be.
 const NO_IMAGES = new Set([
@@ -336,6 +347,7 @@ const NO_IMAGES = new Set([
   "inkling-none", "inkling-low", "inkling-medium", "inkling-high", "inkling-xhigh", "inkling-max",
   "deepseek-v4-flash-high", "deepseek-v4-flash-max", "deepseek-v4-pro-high", "deepseek-v4-pro-max",
   "nemotron-3-ultra-none", "nemotron-3-ultra-medium", "nemotron-3-ultra-high",
+  "swe-2-flash-medium", "swe-2-flash-high", "swe-2-flash-max",
 ])
 const SNAPSHOT_IMAGES = Object.fromEntries(SNAPSHOT.flatMap(([, , , vs]) => vs.map(([id]) => [id, !NO_IMAGES.has(id)])))
 
@@ -558,7 +570,8 @@ function configModel(m) {
     temperature: true,
     modalities: { input: image ? ["text", "image"] : ["text"], output: ["text"] },
     limit: { context: m.context, output: m.output },
-    ...(m.efforts.length ? { variants: Object.fromEntries(m.efforts.map((e) => [e, { reasoningEffort: e }])) } : {}),
+    ...(isClaude(m.id) ? { provider: { npm: ANTHROPIC, api: BASE } } : {}),
+    ...(m.efforts.length ? { variants: Object.fromEntries(m.efforts.map((e) => [e, variantOf(m.id, e)])) } : {}),
   }
 }
 
@@ -568,7 +581,7 @@ function runtimeModel(m) {
     id: m.id,
     providerID: ID,
     name: m.name,
-    api: { id: m.id, url: BASE, npm: CHAT },
+    api: { id: m.id, url: BASE, npm: npmOf(m.id) },
     status: "active",
     headers: {},
     options: {},
@@ -584,7 +597,7 @@ function runtimeModel(m) {
       interleaved: false,
     },
     release_date: "",
-    variants: Object.fromEntries(m.efforts.map((e) => [e, { reasoningEffort: e }])),
+    variants: Object.fromEntries(m.efforts.map((e) => [e, variantOf(m.id, e)])),
     // magpie's: a model the account's quota doesn't count
     ...(m.free ? { free: true } : {}),
   }
@@ -1192,12 +1205,20 @@ function joinSplitCalls(msgs) {
     const prev = out.at(-1)
     if (m?.role === "assistant" && prev?.role === "assistant" && prev.tool_calls?.length) {
       const content = [textOf(prev.content), textOf(m.content)].filter(Boolean).join("\n\n")
-      out[out.length - 1] = { ...prev, content, tool_calls: [...prev.tool_calls, ...(m.tool_calls ?? [])] }
+      const reasoning = [reasoningOf(prev), reasoningOf(m)].filter(Boolean).join("\n\n")
+      out[out.length - 1] = { ...prev, content, tool_calls: [...prev.tool_calls, ...(m.tool_calls ?? [])], ...(reasoning ? { reasoning_content: reasoning } : {}) }
       continue
     }
     out.push(m)
   }
   return out
+}
+
+// reasoningOf is an assistant message's reasoning as a chat completion
+// carries it: reasoning_content, or reasoning as some clients name it.
+function reasoningOf(m) {
+  for (const v of [m?.reasoning_content, m?.reasoning]) if (typeof v === "string" && v) return v
+  return ""
 }
 
 // effortOf is the effort a request names, as magpie reads it.
@@ -1453,6 +1474,7 @@ function noted(text) {
 // build is the GetChatMessage request for a chat completion, to the model
 // uid.
 function build(chat, uid, key) {
+  const claude = isClaude(uid)
   const msgs = []
   let pending = [] // calls the last reply made, not yet answered
   const answer = () => {
@@ -1489,7 +1511,13 @@ function build(chat, uid, key) {
       const text = typeof m.content === "string" ? m.content : Array.isArray(m.content) ? m.content.filter((p) => p?.type === "text" && p.text).map((p) => p.text).join("\n\n") : ""
       if (!text && !calls.length) continue // a turn that only thought, or failed
       answer()
-      msgs.push({ role: ASSISTANT, text, calls })
+      // the reply's reasoning goes back as its thinking (11), unsigned, to
+      // a model that isn't Claude: swe-2 stops thinking on a tool loop's
+      // later turns when the turns before carry none (plugins#703). A chat
+      // completion has no field for a signature, and Claude's thinking
+      // goes back only signed (plugins#665), so Claude gets none, as before.
+      const reasoning = claude ? "" : reasoningOf(m)
+      msgs.push({ role: ASSISTANT, text, calls, ...(reasoning ? { thinking: { text: reasoning } } : {}) })
       // a copy: answering a call takes it off pending, never off the
       // reply that made it, which goes to Devin with every call it made
       pending = [...calls]
@@ -1565,40 +1593,89 @@ function build(chat, uid, key) {
     }
     msgs[at].text = joinNonEmpty(instructions, msgs[at].text)
   }
+  return encodeRequest(msgs, tools, { max: chat.max_completion_tokens || chat.max_tokens, temperature: chat.temperature, top_p: chat.top_p }, uid, key)
+}
 
-  const out = new PB().bytes(1, metadata(key))
-  for (const m of msgs) out.bytes(3, encodeMsg(m))
-  out.varint(7, 5)
-  const max = chat.max_completion_tokens || chat.max_tokens || 128000 // the server holds it to the model's own
+// encodeRequest is the GetChatMessage request of msgs, with tools offered
+// and the sampling asked, to the model uid. Its cache keepalive ping
+// (keepalivePing) is the same request, byte for byte, with one more user
+// prompt, "continue", and max_tokens 1, as the devin CLI pings
+// (plugins#592): each prompt is encoded once, so both carry the same bytes.
+function encodeRequest(msgs, tools, chat, uid, key) {
+  const head = metadata(key).done()
+  const prompts = msgs.map(encodeMsg)
   // Devin answers "an internal error occurred" to a temperature or top_p of
   // exactly 0 (on every model: its Claude ones and swe-2), where 1e-6 goes
   // through; a 0 is sent as the smallest step above it, as near greedy
   const above0 = (v) => (v === 0 ? 1e-6 : v)
   const temp = above0(typeof chat.temperature === "number" ? chat.temperature : 1)
   const topP = above0(typeof chat.top_p === "number" ? chat.top_p : 0.95)
-  out.bytes(8, new PB().varint(1, 1).varint(2, max).varint(3, 400).double(5, temp).varint(7, 40).double(8, topP))
+  const sampling = (max) => new PB().varint(1, 1).varint(2, max).varint(3, 400).double(5, temp).varint(7, 40).double(8, topP)
 
   // the caller's tools, and any the conversation used that it no longer
   // offers
   const offered = new Set()
+  const toolParts = []
   const tool = (name, desc, schema) => {
     if (!schema || typeof schema !== "object") schema = { type: "object", properties: {} }
     offered.add(name)
-    out.bytes(10, new PB().str(1, name).str(2, desc || name).bytes(3, JSON.stringify(schema)))
+    toolParts.push(new PB().str(1, name).str(2, desc || name).bytes(3, JSON.stringify(schema)).done())
   }
   for (const t of tools) tool(t.name, t.description ? `Described under <tool name="${t.name}"> in <tool_descriptions>, in the instructions.` : "", t.schema)
   for (const m of msgs) for (const c of m.calls ?? []) if (!offered.has(c.name)) tool(c.name, "Tool")
-  return out.str(21, uid).done()
+
+  const assemble = (more, max) => {
+    const out = new PB().bytes(1, head)
+    for (const p of [...prompts, ...more]) out.bytes(3, p)
+    out.varint(7, 5)
+    out.bytes(8, sampling(max))
+    for (const t of toolParts) out.bytes(10, t)
+    return out.str(21, uid).done()
+  }
+  const bytes = assemble([], chat.max || 128000) // the server holds max to the model's own
+  pingOf.set(bytes, () => assemble([encodeMsg({ role: USER, text: "continue" })], 1))
+  return bytes
 }
+
+// pingOf is each request's keepalive ping, made when one is first sent
+const pingOf = new WeakMap()
+const keepalivePing = (bytes) => pingOf.get(bytes)?.()
 
 function encodeMsg(m) {
   const b = new PB().str(1, randomUUID()).varint(2, m.role)
   if (m.text) b.str(3, m.text)
   for (const c of m.calls ?? []) b.bytes(6, new PB().str(1, c.id ?? "").str(2, c.name ?? "").bytes(3, c.args))
   if (m.callID) b.str(7, m.callID)
+  // prompt_cache_options {type: EPHEMERAL}, as the devin CLI marks its
+  // own: where the client put cache_control (#566)
+  if (m.cache) b.bytes(8, new PB().varint(1, 1))
   for (const p of m.images ?? []) b.bytes(10, new PB().str(1, p.data).str(2, p.type))
+  // the thinking the reply had, sent back as Devin wrote it: thinking
+  // (11), and Claude's signature (12) and signature_type (18) when it was
+  // signed (plugins#665). Another model's thinking has no signature and
+  // goes back as its text alone (plugins#703); which thinking reaches
+  // here is the builders' to say.
+  if (m.thinking?.text) b.str(11, m.thinking.text)
+  if (m.thinking?.signature) {
+    b.str(12, m.thinking.signature)
+    if (m.thinking.type) b.str(18, m.thinking.type)
+  }
   return b.done()
 }
+
+// sigTypes is each thinking signature's type (delta_signature_type) as
+// Devin said it, by the signature, for the next request's thinking: a
+// Messages thinking block has no field for it. The most recent are kept;
+// one not kept is Anthropic's, which is what Devin says for Claude's.
+const sigTypes = new Map()
+const SIG_TYPES_KEPT = 512
+function rememberSigType(signature, type) {
+  if (!signature || !type) return
+  sigTypes.delete(signature)
+  sigTypes.set(signature, type)
+  if (sigTypes.size > SIG_TYPES_KEPT) sigTypes.delete(sigTypes.keys().next().value)
+}
+const sigTypeOf = (signature) => sigTypes.get(signature) ?? "anthropic"
 
 // ---- the reply -----------------------------------------------------------------------
 
@@ -1666,6 +1743,13 @@ async function* events(it) {
       } else if (x.num === 9 && x.wire === 2 && x.data.length) {
         said += x.data.length
         yield { reasoning: dec.decode(x.data) }
+      } else if (x.num === 10 && x.wire === 2 && x.data.length) {
+        // delta_signature: the thinking's signature, Claude's opaque state
+        // to continue it from (plugins#665); no words of the reply
+        yield { signature: dec.decode(x.data) }
+      } else if (x.num === 21 && x.wire === 2 && x.data.length) {
+        // delta_signature_type: whose signature it is ("anthropic")
+        yield { signatureType: dec.decode(x.data) }
       } else if (x.num === 6 && x.wire === 2) {
         let id = ""
         let name = ""
@@ -1706,6 +1790,7 @@ async function* events(it) {
       total_tokens: prompt + usage.output,
       prompt_tokens_details: { cached_tokens: usage.cacheRead, cache_write_tokens: usage.cacheWrite },
     },
+    tokens: usage,
   }
 }
 
@@ -1726,14 +1811,27 @@ async function* prepend(first, rest) {
 
 // roundtrip sends a chat to GetChatMessage and answers with its event
 // iterator, or an error ({status, message}).
-async function roundtrip({ key, server, families }, chat, signal) {
-  const uid = variantFor(families, chat.model, effortOf(chat.reasoning_effort))
-  const body = frame(build(chat, uid, key))
+// A wire is how a request is read: chat completions' or Messages'.
+const CHAT_WIRE = { effort: (chat) => effortOf(chat.reasoning_effort), build }
+const MESSAGES = { effort: anthropicEffort, build: buildMessages }
+
+// rpcHeaders are a GetChatMessage's headers for a framed body.
+const rpcHeaders = (key, body) => ({ "Content-Type": "application/connect+proto", "Connect-Protocol-Version": "1", ...(body[0] & 1 ? { "Connect-Content-Encoding": "gzip" } : {}), Authorization: "Basic " + key })
+
+// keep, when given, is the conversation's cache keepalive (keepaliveFor):
+// once the reply has finished, its pings are scheduled.
+async function roundtrip({ key, server, families, keep }, chat, signal, wire = CHAT_WIRE) {
+  const uid = variantFor(families, chat.model, wire.effort(chat))
+  const msg = wire.build(chat, uid, key)
+  const body = frame(msg)
+  // when Devin was asked, which its cache's 5 minutes run from: the pings
+  // are timed from it, not from the reply's end (plugins#626)
+  const sentAt = now()
   let res
   try {
     res = await fetch(server + CHAT_RPC, {
       method: "POST",
-      headers: { "Content-Type": "application/connect+proto", "Connect-Protocol-Version": "1", ...(body[0] & 1 ? { "Connect-Content-Encoding": "gzip" } : {}), Authorization: "Basic " + key },
+      headers: rpcHeaders(key, body),
       body,
       signal,
     })
@@ -1763,12 +1861,13 @@ async function roundtrip({ key, server, families }, chat, signal) {
     await fr.return?.()
     return head.value.error
   }
-  return { it: prepend(head.value, source) }
+  const it = prepend(head.value, source)
+  return { it: keep ? keptAfter(it, keep, { key, server, msg, sentAt }) : it, uid }
 }
 
 // complete answers a chat completion through GetChatMessage.
-async function complete({ key, server, families }, chat, signal) {
-  const rt = await roundtrip({ key, server, families }, chat, signal)
+async function complete({ key, server, families, keep }, chat, signal) {
+  const rt = await roundtrip({ key, server, families, keep }, chat, signal)
   if (!rt.it) return errorResponse(rt)
   const it = rt.it
   const id = "chatcmpl-" + randomBytes(12).toString("hex")
@@ -1802,7 +1901,11 @@ async function complete({ key, server, families }, chat, signal) {
         began = true
         ctl.enqueue(chunk({ role: "assistant", content: "" }))
       }
-      const r = await it.next()
+      // a pull that sends nothing isn't pulled again: what a chat
+      // completion has no field for (a thinking signature) is passed over
+      let r
+      do r = await it.next()
+      while (!r.done && (r.value.signature || r.value.signatureType))
       if (r.done) {
         ctl.enqueue(enc.encode("data: [DONE]\n\n"))
         return ctl.close()
@@ -1823,6 +1926,579 @@ async function complete({ key, server, families }, chat, signal) {
     },
   })
   return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Magpie-Sign-In": "kept" } })
+}
+
+// ---- Anthropic's Messages, for the Claude models ------------------------------------
+
+// Claude Code's billing line, a system block of its own whose cch changes
+// every turn: Devin would read it as the prompt's first words, and no
+// turn's prefix would be the last's
+const BILLING_LINE = /^x-anthropic-billing-header:(\s*[A-Za-z_]+=[^;\s]*;)*\s*(\n|$)/
+
+// marked says whether the client asked for the cache to end at a block.
+const marked = (b) => !!(b && typeof b === "object" && b.cache_control && typeof b.cache_control === "object")
+
+// anthropicImage is an image block as Devin takes an image, or null for
+// one that carries no bytes (Devin takes no URL).
+function anthropicImage(b) {
+  const s = b?.type === "image" ? b.source : null
+  if (s?.type !== "base64" || !s.data) return null
+  return { data: s.data, type: s.media_type || "image/png" }
+}
+
+// anthropicEffort is the effort a Messages request asks for, as magpie
+// reads it: output_config's, else the thinking budget's; none with the
+// thinking turned off.
+function anthropicEffort(req) {
+  const t = req.thinking?.type
+  if (t === "disabled") return ""
+  if (req.output_config?.effort) return effortOf(req.output_config.effort)
+  if (t !== "enabled" && t !== "adaptive") return ""
+  const n = Number(req.thinking?.budget_tokens) || 0
+  return n <= 0 ? "" : n <= 4096 ? "low" : n <= 12000 ? "medium" : n <= 24000 ? "high" : "xhigh"
+}
+
+// buildMessages is the GetChatMessage request for a Messages request, to
+// the model uid. Each of the client's blocks is a ChatMessagePrompt of its
+// own, in order, and one the client marked with cache_control carries
+// prompt_cache_options: Devin's cache ends only where a prompt says so,
+// and only at a prompt's end, so a block joined to others lost its mark
+// (#566). Every boundary is kept, not only the marked ones: a mark moves
+// forward as the history grows, and the prompts it passed must stay as
+// they were sent for the cache to be read (yetone/magpie#3835).
+function buildMessages(req, uid, key) {
+  const claude = isClaude(uid)
+  // Messages alternate roles; a client that sends two of one role in a row
+  // means one turn
+  const turns = []
+  for (const m of req.messages ?? []) {
+    if (m?.role !== "user" && m?.role !== "assistant" && m?.role !== "system") continue
+    const blocks = typeof m.content === "string" ? (m.content ? [{ type: "text", text: m.content }] : []) : Array.isArray(m.content) ? m.content : []
+    // Empty effort notices must not split a streamed assistant turn.
+    if (m.role === "system" && !blocks.some((b) => b?.type === "text" && typeof b.text === "string" && b.text)) continue
+    const last = turns[turns.length - 1]
+    if (last?.role === m.role) last.blocks.push(...blocks)
+    else turns.push({ role: m.role, blocks: [...blocks] })
+  }
+
+  const msgs = []
+  const notices = [] // held until the pending tool calls are answered
+  let pending = [] // calls the last reply made, not yet answered
+  const answer = () => {
+    for (const c of pending) msgs.push({ role: TOOL, callID: c.id, text: NO_RESULT })
+    pending = []
+    msgs.push(...notices)
+    notices.length = 0
+  }
+  for (const t of turns) {
+    if (t.role === "assistant") {
+      const own = []
+      const calls = []
+      let mark = false // a tool_use the client marked: the prompt with the calls ends there
+      // a thinking block, for the prompt that follows it: Claude's thinking
+      // goes back with its signature, which Anthropic wants on a tool
+      // loop's next turn (plugins#665), and unsigned thinking to Claude
+      // goes no further, as before. Another model's thinking goes back as
+      // its text alone, never with a signature (plugins#703).
+      let thought = null
+      const take = (p) => {
+        if (thought) [p.thinking, thought] = [thought, null]
+        return p
+      }
+      for (const b of t.blocks) {
+        if (b?.type === "text" && typeof b.text === "string") {
+          if (b.text) own.push(take({ role: ASSISTANT, text: b.text, calls: [], cache: marked(b) }))
+          else if (marked(b) && own.length) own[own.length - 1].cache = true
+        } else if (b?.type === "tool_use" && b.name) {
+          calls.push({ id: inID(b.id), name: b.name, args: JSON.stringify(b.input ?? {}) })
+          mark ||= marked(b)
+        } else if (b?.type === "thinking" && claude && typeof b.signature === "string" && b.signature) {
+          // two in a row: the first has a prompt of its own
+          if (thought) own.push(take({ role: ASSISTANT, text: "", calls: [] }))
+          thought = { text: typeof b.thinking === "string" ? b.thinking : "", signature: b.signature, type: sigTypeOf(b.signature) }
+        } else if (b?.type === "thinking" && !claude && typeof b.thinking === "string" && b.thinking) {
+          if (thought) own.push(take({ role: ASSISTANT, text: "", calls: [] }))
+          thought = { text: b.thinking }
+        }
+      }
+      if (calls.length) {
+        if (!own.length || (thought && own[own.length - 1].thinking)) own.push({ role: ASSISTANT, text: "", calls: [] })
+        take(own[own.length - 1])
+        own[own.length - 1].calls = calls
+        own[own.length - 1].cache ||= mark
+      } else if (thought && own.length && !own[own.length - 1].thinking) take(own[own.length - 1])
+      if (!own.length) continue // a turn that only thought
+      answer()
+      msgs.push(...own)
+      pending = [...calls]
+      continue
+    }
+    let held = [] // images ahead of the user's next words in this turn
+    let words = null // the turn's last prompt of the user's own
+    for (const b of t.blocks) {
+      if (b?.type === "tool_result") {
+        // only a call just made is answered, and only once
+        const i = pending.findIndex((c) => c.id === inID(b.tool_use_id))
+        if (i < 0) continue
+        const inner = typeof b.content === "string" ? [{ type: "text", text: b.content }] : Array.isArray(b.content) ? b.content : []
+        const text = inner.filter((x) => x?.type === "text" && x.text).map((x) => x.text).join("\n\n")
+        const images = inner.map(anthropicImage).filter(Boolean)
+        // Devin has no failed mark on a result: it is said in the text, as
+        // magpie's gateway says it on chat completions (failedAsText)
+        const said = text || "(no output)"
+        msgs.push({ role: TOOL, callID: pending[i].id, text: b.is_error ? "Error: " + said : said, images, cache: marked(b) || marked(inner[inner.length - 1]) })
+        pending.splice(i, 1)
+        if (!pending.length) answer()
+        continue
+      }
+      if (b?.type === "text" && typeof b.text === "string") {
+        if (!b.text) {
+          if (marked(b) && words) words.cache = true
+          continue
+        }
+        // Devin requires tool results before the next user prompt. A
+        // system notice can arrive first, so hold it until they follow.
+        if (t.role !== "system") answer()
+        words = { role: USER, text: b.text, images: held, cache: marked(b) }
+        held = []
+        if (t.role === "system" && pending.length) notices.push(words)
+        else msgs.push(words)
+        continue
+      }
+      const im = anthropicImage(b)
+      if (!im) continue
+      // an image goes with the words it follows, or the next ones
+      if (words) {
+        words.images.push(im)
+        words.cache ||= marked(b)
+      } else held.push(im)
+    }
+    if (held.length) {
+      answer()
+      msgs.push({ role: USER, text: "", images: held })
+    }
+  }
+  answer()
+  const last = msgs[msgs.length - 1]
+  if (!last || (last.role === ASSISTANT && !last.calls.length)) msgs.push({ role: USER, text: "Please proceed with the task." })
+
+  // the instructions go ahead of the first user prompt, as in build: the
+  // tools' descriptions, then each system block a prompt of its own, as
+  // Anthropic orders them, so a mark on the system covers the tools too
+  const system = []
+  const blocks = typeof req.system === "string" ? [{ type: "text", text: req.system }] : Array.isArray(req.system) ? req.system : []
+  for (const b of blocks) {
+    if (b?.type !== "text" || typeof b.text !== "string") continue
+    const text = b.text.replace(BILLING_LINE, "")
+    if (text.trim()) system.push({ role: USER, text, cache: marked(b) })
+    else if (marked(b) && system.length) system[system.length - 1].cache = true
+  }
+  const f = req.output_config?.format
+  const format = f?.type === "json_schema" ? formatText({ type: "json_schema", schema: f.schema }) : ""
+  if (format) system.push({ role: USER, text: format })
+  let tools = (req.tools ?? [])
+    .filter((t) => (!t?.type || t.type === "custom") && t.name)
+    .map((t) => ({ name: t.name, description: t.description ?? "", schema: objectRoot(t.input_schema) }))
+  if (req.tool_choice?.type === "none") tools = []
+  const described = toolDescriptions(tools)
+  if (described) system.unshift({ role: USER, text: described, cache: false })
+  if (system.length) {
+    const at = msgs.findIndex((m) => m.role === USER)
+    msgs.splice(at < 0 ? 0 : at, 0, ...system)
+  }
+  return encodeRequest(msgs, tools, { max: req.max_tokens, temperature: req.temperature, top_p: req.top_p }, uid, key)
+}
+
+// anthropicError is a failure as Anthropic words one; like errorResponse,
+// it marks nothing of the account.
+function anthropicError({ status, message }) {
+  const type = { 400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 529: "overloaded_error" }[status] ?? "api_error"
+  return new Response(JSON.stringify({ type: "error", error: { type, message } }), {
+    status,
+    headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
+  })
+}
+
+const STOP_REASON = { tool_calls: "tool_use", length: "max_tokens", stop: "end_turn" }
+const anthropicUsage = (t = {}) => ({ input_tokens: t.input ?? 0, output_tokens: t.output ?? 0, cache_read_input_tokens: t.cacheRead ?? 0, cache_creation_input_tokens: t.cacheWrite ?? 0 })
+
+// completeMessages answers a Messages request through GetChatMessage, as
+// Anthropic would: the reply's blocks, its stop reason and the usage with
+// what was read from the cache and written to it.
+async function completeMessages({ key, server, families, keep }, req, signal) {
+  const rt = await roundtrip({ key, server, families, keep }, req, signal, MESSAGES)
+  if (!rt.it) return anthropicError(rt)
+  const it = rt.it
+  const id = "msg_" + randomBytes(12).toString("hex")
+  // a signature is sent on for Claude's thinking only: another model's
+  // thinking stays unsigned, as before, so no path sends it on as Claude's
+  const claude = isClaude(rt.uid)
+
+  if (!req.stream) {
+    const content = []
+    let stop = "end_turn"
+    let usage = anthropicUsage()
+    const block = (type) => {
+      const b = content[content.length - 1]
+      if (b?.type === type && type !== "tool_use") return b
+      const n = type === "text" ? { type, text: "" } : { type, thinking: "", signature: "" }
+      content.push(n)
+      return n
+    }
+    const args = []
+    let sigType = ""
+    for await (const e of it) {
+      if (e.error) return anthropicError(e.error)
+      if (e.text) block("text").text += e.text
+      if (e.reasoning) block("thinking").thinking += e.reasoning
+      // the signature goes on the thinking it signs, the last one
+      if (e.signature && claude) {
+        const t = content.findLast((b) => b.type === "thinking")
+        if (t) t.signature += e.signature
+      }
+      if (e.signatureType) sigType = e.signatureType
+      if (e.tool) {
+        args[e.tool.index] = ""
+        content.push({ type: "tool_use", id: e.tool.id, name: e.tool.name, input: {}, index: e.tool.index })
+      }
+      if (e.args) args[e.args.index] += e.args.text
+      if (e.stop) [stop, usage] = [STOP_REASON[e.stop] ?? "end_turn", anthropicUsage(e.tokens)]
+    }
+    for (const b of content) {
+      if (b.type !== "tool_use") continue
+      try {
+        b.input = JSON.parse(args[b.index] || "{}")
+      } catch {
+        b.input = {}
+      }
+      delete b.index
+    }
+    for (const b of content) if (b.type === "thinking") rememberSigType(b.signature, sigType)
+    return Response.json({ id, type: "message", role: "assistant", model: req.model, content, stop_reason: stop, stop_sequence: null, usage }, { headers: { "X-Magpie-Sign-In": "kept" } })
+  }
+
+  const sse = (event, data) => enc.encode(`event: ${event}\ndata: ${JSON.stringify({ type: event, ...data })}\n\n`)
+  let began = false
+  let index = -1
+  let open = "" // the kind of the block being sent: text, thinking or tool_use
+  let sig = "" // the signature of the thinking block last sent
+  let sigType = ""
+  const stream = new ReadableStream({
+    async pull(ctl) {
+      if (!began) {
+        began = true
+        ctl.enqueue(sse("message_start", { message: { id, type: "message", role: "assistant", model: req.model, content: [], stop_reason: null, stop_sequence: null, usage: anthropicUsage() } }))
+      }
+      const close = () => {
+        if (open === "thinking") rememberSigType(sig, sigType)
+        if (open) ctl.enqueue(sse("content_block_stop", { index }))
+        open = ""
+      }
+      const start = (kind, content_block) => {
+        close()
+        index++
+        open = kind
+        ctl.enqueue(sse("content_block_start", { index, content_block }))
+      }
+      // a pull that sends nothing isn't pulled again: the events that send
+      // nothing are read past here
+      let r
+      for (;;) {
+        r = await it.next()
+        if (r.done) return ctl.close()
+        const q = r.value
+        if (q.signatureType) {
+          sigType = q.signatureType
+          rememberSigType(sig, sigType)
+          continue
+        }
+        // a signature goes on Claude's thinking block, before its stop, as
+        // Anthropic streams it; one that comes once the block has closed
+        // has no block to go on
+        if (q.signature && !(open === "thinking" && claude)) continue
+        break
+      }
+      const e = r.value
+      if (e.text) {
+        if (open !== "text") start("text", { type: "text", text: "" })
+        ctl.enqueue(sse("content_block_delta", { index, delta: { type: "text_delta", text: e.text } }))
+      } else if (e.reasoning) {
+        if (open !== "thinking") {
+          start("thinking", { type: "thinking", thinking: "", signature: "" })
+          sig = ""
+        }
+        ctl.enqueue(sse("content_block_delta", { index, delta: { type: "thinking_delta", thinking: e.reasoning } }))
+      } else if (e.signature) {
+        sig += e.signature
+        ctl.enqueue(sse("content_block_delta", { index, delta: { type: "signature_delta", signature: e.signature } }))
+      } else if (e.tool) start("tool_use", { type: "tool_use", id: e.tool.id, name: e.tool.name, input: {} })
+      else if (e.args) {
+        if (open === "tool_use") ctl.enqueue(sse("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: e.args.text } }))
+      } else if (e.stop) {
+        close()
+        ctl.enqueue(sse("message_delta", { delta: { stop_reason: STOP_REASON[e.stop] ?? "end_turn", stop_sequence: null }, usage: anthropicUsage(e.tokens) }))
+        ctl.enqueue(sse("message_stop", {}))
+      } else if (e.error) {
+        ctl.enqueue(enc.encode(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: e.error.message } })}\n\n`))
+        ctl.close()
+      }
+    },
+    cancel() {
+      it.return?.()
+    },
+  })
+  return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Magpie-Sign-In": "kept" } })
+}
+
+// ---- cache keepalive (plugins#592) -----------------------------------------------
+
+// Devin's prompt cache lasts 5 minutes, and has no longer TTL to ask for
+// (PromptCacheOptions has only type EPHEMERAL). The devin CLI keeps it warm
+// (3000.11.205, cache_keepalive.rs): after a reply it sends the same
+// GetChatMessage again every 285 s, with "continue" at the end and
+// max_tokens 1, which reads the cache and renews it. This is the same,
+// off by default (each ping is billed as a read of the whole context):
+// after any reply that read or wrote the cache, up to max pings, until the
+// conversation's next real request, a refusal (401, 402, 429) or two
+// pings in a row that read less than half their prompt from the cache.
+// Unlike the CLI's, it also runs while the user is reading, not only while
+// a tool or subagent works: magpie can't tell those apart, and the issue's
+// reporter wants both. The CLI's ping carries query_label
+// "cache_keepalive" in its trace; this plugin labels no request, so its
+// ping doesn't either.
+const KEEPALIVE = "cache_keepalive"
+const KEEPALIVE_INTERVAL = 285 // seconds
+const KEEPALIVE_MAX = 6
+const KEEPALIVE_KEPT = 32 // conversations kept warm at once; past it the oldest stops
+const KEEPALIVE_STOP = new Set([401, 402, 429])
+
+// timers are what the pings wait on, and the clock they are timed by;
+// tests hand in their own. A timer is unref'd: it never keeps a process or
+// a test running.
+const realTimers = { set: (fn, ms) => setTimeout(fn, ms), clear: (t) => clearTimeout(t), now: () => Date.now() }
+let timers = realTimers
+const now = () => (timers.now ?? Date.now)()
+
+const keeps = new Map() // conversation → {n, misses, timer, ctl}
+
+// keepaliveSettings are the interval (ms) and the most pings, from the
+// plugin's options (cacheKeepaliveInterval in seconds, 30–299;
+// cacheKeepaliveMaxPings, 1–50), else the CLI's interval and 6.
+function keepaliveSettings(options = {}) {
+  const sec = Number(options?.cacheKeepaliveInterval)
+  const max = Number(options?.cacheKeepaliveMaxPings)
+  return {
+    interval: (Number.isFinite(sec) && sec >= 30 && sec <= 299 ? sec : KEEPALIVE_INTERVAL) * 1000,
+    max: Number.isInteger(max) && max >= 1 && max <= 50 ? max : KEEPALIVE_MAX,
+  }
+}
+
+// the headers an agent names its session in, as magpie's gateway reads them;
+// first magpie's own, which tells a plugin's fetch the session the agent
+// named to magpie (the agent's own headers never reach the plugin through
+// magpie: plugins#620)
+const SESSION_HEADERS = ["x-magpie-session", "x-claude-code-session-id", "x-session-id", "session_id", "session-id", "x-opencode-session", "x-session-affinity", "x-conversation-id"]
+
+// textsOf is a message's or system's words, without the cache marks a
+// client moves forward as the history grows
+const textsOf = (c) => (typeof c === "string" ? [c] : Array.isArray(c) ? c.map((b) => (typeof b === "string" ? b : typeof b?.text === "string" ? b.text : b?.type ?? "")) : [])
+
+// keepaliveKey is the conversation a request is of: the session the agent
+// names, the Claude Code subagent it is of (x-claude-code-agent-id, never
+// sent for the lead's own turns), and a hash of what every turn of it
+// shares: the instructions and the tools' names. A subagent's, or Claude
+// Code's permission check's, instructions and tools are their own, so their
+// requests never stop the lead's pings, nor the lead's theirs.
+//
+// The first user message is not part of it: Claude Code Auto's permission
+// check sends the whole history in its first message, which grows on every
+// check, and each check's key was then new, so a check left its older
+// pings running beside its new ones (plugins#620, zelong77). Only a
+// request that names no session is told apart by its first message too,
+// as two conversations could share the rest; there, a first message that
+// grew from one seen before (blocks added, or the last one's text added
+// to) is still that conversation (firstOf).
+function keepaliveKey(req, messages, headers) {
+  let h
+  try {
+    h = new Headers(headers ?? {})
+  } catch {
+    h = new Headers()
+  }
+  const session = SESSION_HEADERS.map((k) => h.get(k)?.trim()).find(Boolean) ?? ""
+  // the Claude Code subagent, as Claude Code names it, or as magpie tells
+  // the plugin it (x-magpie-subagent)
+  const agent = (h.get("x-claude-code-agent-id")?.trim() || h.get("x-magpie-subagent")?.trim()) ?? ""
+  let prefix, first
+  if (messages) {
+    const system = textsOf(req.system).map((t) => t.replace(BILLING_LINE, ""))
+    prefix = [system, (req.tools ?? []).map((t) => t?.name ?? "")]
+    first = textsOf(req.messages?.[0]?.content)
+  } else {
+    const ms = req.messages ?? []
+    const system = ms.filter((m) => m?.role === "system" || m?.role === "developer").map((m) => textsOf(m.content))
+    prefix = [system, (req.tools ?? []).map((t) => t?.function?.name ?? "")]
+    first = textsOf(ms.find((m) => m?.role === "user")?.content)
+  }
+  const group = [session, agent, sha(JSON.stringify(prefix))].join("\n")
+  if (session) return group
+  return firstOf(group, first)
+}
+
+const sha = (s) => createHash("sha256").update(s).digest("hex").slice(0, 32)
+
+// firsts are the first messages of the conversations seen without a
+// session, by key: each block's hash but the last's, and the last's length
+// and hash, so a grown message is told without holding its text
+const firsts = new Map() // key → {group, n, blocks: [hash], last: {len, hash}}
+const FIRSTS_KEPT = 256
+
+// firstOf is the key of the conversation, in group, whose first message
+// first is, or grew from (the longest such one), else a new key.
+function firstOf(group, first) {
+  const hashes = first.map(sha)
+  let best, most
+  for (const [id, f] of firsts) {
+    if (f.group !== group || f.n > first.length || (f.n === 0) !== (first.length === 0)) continue
+    if (f.n > 0) {
+      const t = first[f.n - 1]
+      if (f.blocks.some((x, j) => x !== hashes[j]) || t.length < f.last.len || sha(t.slice(0, f.last.len)) !== f.last.hash) continue
+    }
+    if (!best || f.n > most.n || (f.n === most.n && f.last.len > most.last.len)) (best = id), (most = f)
+  }
+  const id = best ?? [group, sha(JSON.stringify(first))].join("\n")
+  const t = first.at(-1) ?? ""
+  firsts.delete(id)
+  firsts.set(id, { group, n: first.length, blocks: hashes.slice(0, -1), last: { len: t.length, hash: sha(t) } })
+  while (firsts.size > FIRSTS_KEPT) firsts.delete(firsts.keys().next().value)
+  return id
+}
+
+// stopKeepalive stops a conversation's pings, one in flight too.
+function stopKeepalive(id) {
+  const k = keeps.get(id)
+  if (!k) return
+  keeps.delete(id)
+  if (k.timer) timers.clear(k.timer)
+  k.ctl?.abort()
+}
+
+function stopAllKeepalive() {
+  for (const id of [...keeps.keys()]) stopKeepalive(id)
+}
+
+// the pings stop with the process that sends them (the plugin host)
+let exitHooked = false
+function hookExit() {
+  if (exitHooked) return
+  exitHooked = true
+  process.once?.("exit", stopAllKeepalive)
+}
+
+// pingOnce sends a ping and reads its status and usage, and why it
+// failed (error).
+async function pingOnce(server, key, body, signal) {
+  let res
+  try {
+    res = await fetch(server + CHAT_RPC, { method: "POST", headers: rpcHeaders(key, body), body, signal })
+  } catch (e) {
+    return { status: 0, error: String(e?.message || e || "fetch failed") }
+  }
+  const failed = (e) => ({ status: e.status, error: e.message })
+  if (!res.ok) return failed(failure(res.status, (await res.text().catch(() => "")).slice(0, 1 << 16)))
+  const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  try {
+    for await (const f of frames(res.body)) {
+      if (f.end) {
+        const e = failure(200, dec.decode(f.data))
+        if (e.status >= 300) return failed(e)
+        break
+      }
+      for (const x of fields(f.data)) {
+        if (x.num !== 7 || x.wire !== 2) continue
+        for (const g of fields(x.data)) {
+          if (g.wire !== 0) continue
+          if (g.num === 2) tokens.input = g.n
+          else if (g.num === 3) tokens.output = g.n
+          else if (g.num === 4) tokens.cacheWrite = g.n
+          else if (g.num === 5) tokens.cacheRead = g.n
+        }
+      }
+    }
+  } catch (e) {
+    return { status: 0, error: String(e?.message || e || "the reply broke off") }
+  }
+  return { status: 200, tokens }
+}
+
+// reportPing tells magpie of a ping, for its request log and usage
+// totals (magpie.usage, plugins#592): the pings were invisible there, as
+// they never pass magpie's gateway. They go straight to Devin, as the
+// gateway would re-shape the request and the cache would no longer match.
+// An aborted one (a real request came) went nowhere worth counting; an
+// older magpie, or OpenCode, has no magpie.usage and is told nothing.
+function reportPing(keep, r, ms) {
+  if (!keep.report || r.aborted) return
+  const t = r.tokens ?? {}
+  try {
+    keep.report({ kind: KEEPALIVE, model: keep.model, account: keep.account, input: t.input, output: t.output, cacheRead: t.cacheRead, cacheWrite: t.cacheWrite, status: r.status, ms, error: r.error })
+  } catch {}
+}
+
+// scheduleKeepalive starts a conversation's pings for the request msg
+// just answered, sent at sentAt, in place of any it had.
+//
+// Each ping is timed from when the request before it was sent, the real
+// one's or the ping's own, not from when it was answered: Devin renews its
+// cache when it takes a request, and a reply of 30 to 47 s (Fable over half
+// a million tokens), or a ping of 10 to 20 s, put the next ping past the
+// cache's 5 minutes when it waited its whole interval from the end. Pings
+// 315.9 s or more after the request they followed was sent missed, and
+// each wrote the whole context again (plugins#626, zelong77). One that
+// came back after its interval had passed is followed at once.
+function scheduleKeepalive(keep, key, server, msg, sentAt = now()) {
+  const { id, interval, max } = keep
+  const ping = keepalivePing(msg)
+  if (!ping) return
+  stopKeepalive(id)
+  while (keeps.size >= KEEPALIVE_KEPT) stopKeepalive(keeps.keys().next().value)
+  const body = frame(ping)
+  const k = { n: 0, misses: 0, timer: null, ctl: null }
+  keeps.set(id, k)
+  hookExit()
+  const next = (from) => {
+    k.timer = timers.set(run, Math.max(0, interval - Math.max(0, now() - from)))
+    k.timer?.unref?.()
+  }
+  const run = async () => {
+    k.timer = null
+    if (keeps.get(id) !== k) return
+    k.n++
+    const ctl = (k.ctl = new AbortController())
+    const at = now()
+    const r = await pingOnce(server, key, body, ctl.signal)
+    k.ctl = null
+    reportPing(keep, { ...r, aborted: ctl.signal.aborted }, now() - at)
+    if (keeps.get(id) !== k) return // a real request came, or the switch went off
+    if (KEEPALIVE_STOP.has(r.status)) return stopKeepalive(id)
+    const t = r.tokens
+    const hit = r.status === 200 && t.cacheRead > 0 && t.cacheRead * 2 >= t.input + t.cacheRead + t.cacheWrite
+    k.misses = hit ? 0 : k.misses + 1
+    if (k.misses >= 2 || k.n >= max) return stopKeepalive(id)
+    next(at)
+  }
+  next(sentAt)
+}
+
+// keptAfter passes a reply's events on, and once it has finished (any stop:
+// a tool call waiting too) schedules the conversation's pings, when the
+// reply read or wrote the cache: a request with nothing cached has nothing
+// to keep.
+async function* keptAfter(it, keep, { key, server, msg, sentAt }) {
+  for await (const e of it) {
+    if (e.stop && (e.tokens?.cacheRead || e.tokens?.cacheWrite)) scheduleKeepalive(keep, key, server, msg, sentAt)
+    yield e
+  }
 }
 
 // ---- OpenCode 2 ----------------------------------------------------------------------
@@ -1875,14 +2551,18 @@ function v2Chat(options, modelID) {
     }
     if (m.role === "assistant") {
       let text = ""
+      let reasoning = ""
       const calls = []
       for (const p of m.content ?? []) {
         if (p.type === "text") text += (text ? "\n\n" : "") + p.text
+        // the reply's reasoning, which build sends back to a model that
+        // isn't Claude (plugins#703)
+        else if (p.type === "reasoning" && typeof p.text === "string" && p.text) reasoning += (reasoning ? "\n\n" : "") + p.text
         else if (p.type === "tool-call")
           calls.push({ id: p.toolCallId, type: "function", function: { name: p.toolName, arguments: JSON.stringify(p.input ?? {}) } })
       }
       if (!text && !calls.length) continue
-      messages.push({ role: "assistant", content: text, ...(calls.length ? { tool_calls: calls } : {}) })
+      messages.push({ role: "assistant", content: text, ...(reasoning ? { reasoning_content: reasoning } : {}), ...(calls.length ? { tool_calls: calls } : {}) })
       continue
     }
     if (m.role === "tool") {
@@ -2299,8 +2979,8 @@ export default {
   async setup(ctx) {
     await v2Setup(ctx)
   },
-  async server(input) {
-    return DevinAuthPlugin(input)
+  async server(input, options) {
+    return DevinAuthPlugin(input, options)
   },
 }
 
@@ -2412,7 +3092,12 @@ async function live(auth) {
   return { key: auth?.key, server: serverOf(auth) }
 }
 
-export async function DevinAuthPlugin({ client } = {}) {
+export async function DevinAuthPlugin({ client, magpie } = {}, options = {}) {
+  // each ping, to magpie's request log (an older magpie has no usage)
+  const report = typeof magpie?.usage === "function" ? (call) => magpie.usage(ID, call) : null
+  // the cache keepalive: magpie's switch, or in OpenCode the plugin's
+  // option cacheKeepalive: true
+  const keepOn = () => magpie?.option?.(ID, KEEPALIVE) === true || options?.cacheKeepalive === true
   return {
     auth: {
       provider: ID,
@@ -2423,26 +3108,58 @@ export async function DevinAuthPlugin({ client } = {}) {
           baseURL: BASE,
           apiKey: auth.key,
           async fetch(input, init = {}) {
-            const now = await getAuth()
-            if (now?.type !== "api" || !now.key) return errorResponse({ status: 401, message: "Devin isn't signed in" })
             const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
-            if (!/\/chat\/completions$/.test(new URL(url).pathname)) return errorResponse({ status: 404, message: "only chat completions are served" })
+            const path = new URL(url).pathname
+            const messages = /\/messages$/.test(path)
+            const now = await getAuth()
+            if (now?.type !== "api" || !now.key) return (messages ? anthropicError : errorResponse)({ status: 401, message: "Devin isn't signed in" })
+            if (!messages && !/\/chat\/completions$/.test(path)) {
+              const e = { status: 404, message: "only chat completions and messages are served" }
+              return /\/messages\//.test(path) ? anthropicError(e) : errorResponse(e)
+            }
             let chat
             try {
               const b = init.body ?? (input instanceof Request ? await input.clone().text() : undefined)
               chat = JSON.parse(typeof b === "string" ? b : dec.decode(b))
             } catch {
-              return errorResponse({ status: 400, message: "a request that isn't JSON" })
+              return (messages ? anthropicError : errorResponse)({ status: 400, message: "a request that isn't JSON" })
+            }
+            // a real request for a conversation stops its pings; its own
+            // reply starts them again
+            let keep
+            const on = keepOn()
+            if (!on) stopAllKeepalive()
+            else {
+              const id = keepaliveKey(chat, messages, init.headers ?? (input instanceof Request ? input.headers : undefined))
+              stopKeepalive(id)
+              // the model and account the pings are reported as: the
+              // request's, as magpie names them while it is in hand
+              keep = { id, ...keepaliveSettings(options), report, model: chat.model, account: magpie?.account?.(ID) }
             }
             const { key, server } = await live(now)
             const families = await familiesFor(key, server)
-            return complete({ key, server, families }, chat, init.signal)
+            return (messages ? completeMessages : complete)({ key, server, families, keep }, chat, init.signal)
           },
         }
       },
       methods: [
         { type: "oauth", label: "Devin (browser)", authorize: browserSignIn },
         { type: "oauth", label: "Devin CLI's sign-in", authorize: cliSignIn },
+      ],
+      // magpie's own switches (OpenCode never reads auth.options)
+      options: [
+        {
+          key: KEEPALIVE,
+          label: "Keep the cache warm",
+          description: "Devin keeps a prompt cache for 5 minutes. When on, after a reply the conversation is sent again with max_tokens 1 every 285 s, up to 6 times, so a later turn reads the cache. Each ping is billed as a cache read of the whole context and shown in Usage. Interval and count: Plugins › Options.",
+          labels: { zh: "缓存保活", "zh-TW": "快取保活", ja: "キャッシュを保持", de: "Cache warm halten" },
+          descriptions: {
+            zh: "Devin 的提示词缓存只保留 5 分钟。开启后，每次回复结束会每 285 秒以 max_tokens 1 重发一次对话，最多 6 次，让之后的回合读取缓存而不是重写。每次保活都按整段上下文的缓存读取计费，并在用量里记为「缓存保活」。间隔和次数在插件 › 选项里改。",
+            "zh-TW": "Devin 的提示詞快取只保留 5 分鐘。開啟後，每次回覆結束會每 285 秒以 max_tokens 1 重送一次對話，最多 6 次，讓之後的回合讀取快取而不是重寫。每次保活都以整段上下文的快取讀取計費，並在用量裡記為「快取保活」。間隔和次數在外掛 › 選項裡改。",
+            ja: "Devin のプロンプトキャッシュは 5 分しか保持されません。オンにすると、返信のあと 285 秒ごとに会話を max_tokens 1 で再送し（最大 6 回）、次のターンがキャッシュを読めるようにします。各 ping はコンテキスト全体のキャッシュ読み取りとして課金され、使用量に表示されます。間隔と回数はプラグイン › オプションで変更できます。",
+            de: "Devin hält einen Prompt-Cache nur 5 Minuten. Ist dies an, wird das Gespräch nach einer Antwort alle 285 s mit max_tokens 1 erneut gesendet, bis zu 6-mal. Jeder Ping wird als Cache-Lesen des ganzen Kontexts berechnet und unter Nutzung gezeigt. Intervall und Anzahl: Erweiterungen › Optionen.",
+          },
+        },
       ],
       // magpie's: the plan and how much of its quota is gone. The built-in
       // read none, so no read marks the account or clears it, not even a
@@ -2513,4 +3230,4 @@ export async function DevinAuthPlugin({ client } = {}) {
 }
 
 // for tests
-export const _internal = { parseFree, parsePrices, geminiSchema, freeIDs, outID, inID, objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, parseConfigFamilies, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoOfStatus, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames, v2Chat, v2ToolParts, v2FileData, v2Effort, v2ResponseFormat, v2Usage, v2Auth, v2Credential, v2Models, devinLanguage, v2Setup, connKey }
+export const _internal = { sigTypeOf, forgetSigTypes: () => sigTypes.clear(), keepaliveKey, keepaliveSettings, keepalivePing, scheduleKeepalive, stopKeepalive, stopAllKeepalive, keeping: () => [...keeps.keys()], useTimers: (t) => (timers = t ?? realTimers), KEEPALIVE, buildMessages, completeMessages, anthropicEffort, encodeMsg, parseFree, parsePrices, geminiSchema, freeIDs, outID, inID, objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, parseConfigFamilies, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoOfStatus, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames, v2Chat, v2ToolParts, v2FileData, v2Effort, v2ResponseFormat, v2Usage, v2Auth, v2Credential, v2Models, devinLanguage, v2Setup, connKey }

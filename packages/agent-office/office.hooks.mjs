@@ -20,6 +20,7 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createTracker } from "./lib/track.mjs"
 import { createScanner } from "./lib/scan.mjs"
+import { createJumper, judgeJump } from "./lib/jump.mjs"
 
 const here = dirname(fileURLToPath(import.meta.url))
 // the page's folder, where live.js goes; a test points this elsewhere so it
@@ -43,9 +44,12 @@ const ownDir = (() => { try { return realpathSync(here) } catch { return here } 
 
 let tracker = null
 let scanner = null
+let jumper = null
 let timer = null
 let ticking = null
 let last = ""
+let lastJumpAt = 0
+let lastJumpPromise = null
 // fail closed: until an install's options are read, or a request carries
 // them, no prompt, reply or command is written
 let options = { text: false }
@@ -54,7 +58,7 @@ function track(opts) {
   const o = { text: opts?.text !== false, remote: opts?.remote === true }
   if (tracker && tracker.options.text === o.text && tracker.options.remote === o.remote) return tracker
   const was = tracker
-  tracker = createTracker(o)
+  tracker = createTracker({ text: o.text, remote: o.remote, dropped: !o.remote && was ? was.snapshot(0).dropped : 0 })
   if (was) for (const [k, s] of was.sessions) tracker.sessions.set(k, s)
   return tracker
 }
@@ -70,6 +74,13 @@ function fromFiles(s, text) {
     started: s.started, updated: Math.max(s.updated || 0, s.touched || 0), touched: s.touched,
     phase: s.phase || "done", step: text ? s.step : (s.stepName || ""), reply: text ? s.reply : "", error: text ? s.error : "",
     pendingSince: s.pending?.[0]?.at || 0, turns: s.turns,
+    // the workbench's extra facts: a child session, its recent words, and
+    // what this session used today. Words are dropped with text off.
+    subagent: s.subagent === true, parent: s.parent || "", profile: s.profile || "",
+    messages: text && Array.isArray(s.messages) ? s.messages.slice(-8) : [],
+    tokensToday: Number(s.tokensToday) || 0, turnsToday: Number(s.turnsToday) || 0,
+    context: Number(s.context) || 0, contextWindow: Number(s.contextWindow) || 0,
+    target: s.target || null,
   }
 }
 
@@ -86,19 +97,22 @@ export function snapshot(now = Date.now()) {
       sessions.push(fromFiles(s, text))
     }
   }
+  if (jumper) jumper.decorate(sessions, now, options.preferredJumpHost || "herdr-app")
   // what only the gateway saw: an agent whose files aren't read here
-  if (tracker) {
-    for (const g of tracker.snapshot(now).sessions) {
+  const tracked = tracker ? track(options).snapshot(now) : null
+  if (tracked) {
+    for (const g of tracked.sessions) {
       if (seen.has(g.key) || fileAgents.has(g.agent)) continue
       seen.add(g.key)
       sessions.push({ ...g, source: "gateway" })
     }
   }
-  return { v: 2, written: now, text, sessions }
+  return { v: 2, written: now, text, dropped: tracked ? tracked.dropped : 0, sessions }
 }
 
 export function write(now = Date.now()) {
   timer = null
+  checkJumpOption()
   let body
   try { body = JSON.stringify(snapshot(now)) } catch { return }
   // only a change is written; the time alone is no change
@@ -123,11 +137,24 @@ function soon() {
 export function start(opts = {}) {
   options = { ...options, ...opts }
   if (!scanner) scanner = createScanner({ days: 2, max: 40, ...(opts.scanner || {}) })
+  if (!jumper && (opts.jumper || !process.env.MAGPIE_AGENT_OFFICE_PAGE)) {
+    jumper = createJumper({ onUpdate: soon, ...(opts.jumper || {}) })
+    void jumper.refreshState(Date.now(), options.preferredJumpHost || "herdr-app")
+  }
+  if (opts.jumpRequest) checkJumpOption(opts.jumpRequest)
   if (!ticking) {
     write()
     ticking = setInterval(write, EVERY)
     ticking.unref?.()
   }
+}
+
+export function jump(req) {
+  return jumper ? jumper.jump(req) : Promise.resolve({ ok: false, steps: [] })
+}
+
+export function waitForJump() {
+  return lastJumpPromise || Promise.resolve(null)
 }
 
 export function stop() {
@@ -140,9 +167,11 @@ export async function onRequest(body, ctx) {
   // not turn back into text:true because a field was missing
   options = { ...options, ...(ctx.options || {}) }
   start()
-  const key = track(options).request(body, ctx, Date.now())
+  const t = track(options)
+  const dropped = t.snapshot(0).dropped
+  const key = t.request(body, ctx, Date.now())
   ctx.state.office = key
-  if (key) soon()
+  if (key || t.snapshot(0).dropped !== dropped) soon()
   ctx.report?.("skipped")
   return undefined
 }
@@ -189,8 +218,61 @@ function readOptions() {
   return null
 }
 
+function jumpCacheFile() {
+  const cache = process.env.XDG_CACHE_HOME || join(process.env.HOME || "", ".cache")
+  return join(cache, "agent-office", "last-jump.json")
+}
+
+function readLastJumpAt() {
+  try {
+    const j = JSON.parse(readFileSync(jumpCacheFile(), "utf8"))
+    const at = Number(j?.at)
+    return Number.isFinite(at) && at > 0 ? at : 0
+  } catch { return 0 }
+}
+
+function writeLastJumpAt(at) {
+  try {
+    const file = jumpCacheFile()
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, JSON.stringify({ at }) + "\n", { mode: 0o600 })
+  } catch {}
+}
+
+function checkJumpOption(directReq) {
+  if (!jumper) return
+  const standalone = !!process.env.MAGPIE_AGENT_OFFICE_PAGE
+  // Standalone CLI and tests set MAGPIE_AGENT_OFFICE_PAGE and pass jumpRequest
+  // explicitly to start(); they must never read or act on magpie's plugins.json.
+  if (standalone && !directReq) return
+  const fresh = standalone ? null : readOptions()
+  if (fresh && typeof fresh.preferredJumpHost === "string") options.preferredJumpHost = fresh.preferredJumpHost
+  const req = directReq || fresh?.jumpRequest
+  if (!req || typeof req !== "object") return
+  const at = Number(req.at || 0)
+  // magpie restarts the plugin host when options.set writes jumpRequest to
+  // plugins.json. Keep the last handled timestamp in our own cache file (never
+  // touching plugins.json) so the freshly started host acts on a ≤15s request
+  // once and never replays it on later restarts. judgeJump keeps a time ahead
+  // of the clock from blocking later requests (#583).
+  const { fire, record } = judgeJump(at, lastJumpAt, Date.now())
+  if (record) {
+    lastJumpAt = at
+    if (!standalone) writeLastJumpAt(at)
+  }
+  if (!fire) return
+  lastJumpPromise = jumper.jump({
+    key: String(req.key || ""),
+    session: String(req.session || ""),
+    preferredHostId: String(req.preferredHostId || options.preferredJumpHost || ""),
+  })
+}
+
 // read what the plugin's options say about text, then start: a host that
 // loads this module starts watching at once, before any request
 const loaded = readOptions()
 if (loaded) options = { text: false, ...loaded }
-if (!process.env.MAGPIE_AGENT_OFFICE_PAGE) start()
+if (!process.env.MAGPIE_AGENT_OFFICE_PAGE) {
+  lastJumpAt = readLastJumpAt()
+  start()
+}

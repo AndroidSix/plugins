@@ -34,7 +34,7 @@ beforeEach(() => {
     if (url.pathname === "/api/v1/zcode-plan/billing/balance") return ok(balance)
     if (url.pathname.endsWith("/messages")) {
       const text = init.body ?? (input instanceof Request ? await input.text() : undefined)
-      sent.push({ origin: url.origin, path: url.pathname, body: JSON.parse(text) })
+      sent.push({ origin: url.origin, path: url.pathname, body: JSON.parse(text), headers: new Headers(init.headers ?? (input instanceof Request ? input.headers : {})) })
       return url.origin === "https://zcode.z.ai" ? giftReply.clone() : ok({ type: "message", content: [] })
     }
     throw new Error("unmocked request blocked: " + url.pathname)
@@ -382,4 +382,55 @@ test("a coding plan account's ZCODE GLOBAL BUILD gift is named by its model firs
   expect(u.windows.map((w) => w.name)).toEqual(["5 hours", "Weekly", "GLM-5.3-Trial · ZCODE GLOBAL BUILD", "GLM-5.3-Flash-Trial · ZCODE GLOBAL BUILD"])
   expect(u.windows[2]).toMatchObject({ used: 15, amount: 450_000, limit: 3_000_000, models: ["GLM-5.3-Trial"] })
   expect(u.windows[3]).toMatchObject({ used: 0, limit: 5_000_000, models: ["GLM-5.3-Flash-Trial"] })
+})
+
+test("a flash gift goes out under ZCode's registry spelling, as the app sends it", async () => {
+  balance.balances[0].capabilities = ["model:glm-5.3-flash"]
+  expect((await send("GLM-5.3-Flash-Trial")).status).toBe(200)
+  expect(sent).toHaveLength(1)
+  expect(sent[0].origin).toBe("https://zcode.z.ai")
+  expect(sent[0].body.model).toBe("GLM-5.3-Flash")
+})
+
+test("a refused-then-rested gift says why it is refused locally", async () => {
+  giftReply = new Response(JSON.stringify({ error: { code: "1302", message: "rate limit" } }), { status: 429, headers: { "content-type": "application/json" } })
+  expect((await send()).status).toBe(429)
+  const again = await send()
+  expect(again.status).toBe(429)
+  expect(sent).toHaveLength(1)
+  expect((await again.json()).error.message).toContain("not asked again for a minute")
+})
+
+// young02036 (Discord, 11-05): two ZCode accounts, one with no GLM Coding
+// Plan whose Start Plan holds only GLM-5.3-Flash, one subscribed whose
+// gift is GLM-5.3-Flash-Trial. The gift-only account listed every model
+// the Start Plan's config names (GLM-5.2, GLM-5-Turbo…), so magpie sent it
+// models its balance has no bucket for, which the ZCode app never offers:
+// the app lists a Start Plan account's models from its balance alone
+// (resolveStartPlanBalanceAvailability). Now the gift-only account lists
+// what its balance names, and a request for anything else is never routed
+// to it. The config's list stands only when the balance names no model.
+test("a gift-only account lists only the models its balance names (young02036)", async () => {
+  _internal.config({
+    revision: 1,
+    config: {
+      providerConfigRules: { providerRules: [{ providerId: "account:zai-start-plan", builtinModelIds: ["GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"] }] },
+      modelConfigRules: { modelRules: [{ modelMatch: "GLM-5\\.3-Flash", config: { properties: { contextWindow: 1_000_000 }, optionSpecs: { maxOutputTokens: { max: 128_000 }, reasoningLevel: { values: ["low", "high", "max"] } } } }] },
+    },
+  })
+  try {
+    balance.plans = [{ plan_id: "zcode-v3-start-plan", user_plan_id: "s1", name: "ZCode Start Plan", status: "active", ends_at: now + 7 * 86400 }]
+    balance.balances = [{ plan_id: "zcode-v3-start-plan", user_plan_id: "s1", show_name: "GLM-5.3-Flash", capabilities: ["model:glm-5.3-flash"], total_units: 5_000_000, used_units: 0, remaining_units: 5_000_000 }]
+    const only = { type: "oauth", access: jwt, refresh: JSON.stringify({ ...state, key: undefined, plan: undefined }), expires: 0 }
+    const models = await (await hooks()).provider.models({ models: {} }, { auth: only })
+    expect(Object.keys(models).sort()).toEqual(["GLM-5.3-Flash", "GLM-5.3-Flash-Trial"])
+    expect(models["GLM-5.3-Flash"].limit.context).toBe(1_000_000)
+    // a balance that names no model leaves the config's list standing
+    _internal.routes.clear()
+    balance.balances = []
+    const bare = await (await hooks()).provider.models({ models: {} }, { auth: only })
+    expect(Object.keys(bare).sort()).toEqual(["GLM-5-Turbo", "GLM-5.2", "GLM-5.3-Flash"])
+  } finally {
+    _internal.config(undefined)
+  }
 })

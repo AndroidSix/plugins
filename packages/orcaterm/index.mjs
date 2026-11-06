@@ -25,6 +25,7 @@ import {
   createLocalCapture,
   exchangeCode,
   looksLikeAccessToken,
+  looksLikeRefreshToken,
   readTokenClaims,
   refreshAccessToken,
   startWechatLogin,
@@ -586,7 +587,10 @@ function toUpstreamBody(body, { conversationId, userId }) {
       continue
     }
     if (role === "assistant") {
-      const t = textOf(msg.content).trim()
+      // An earlier reply the agent kept in the envelope's shape goes up as its
+      // answer: sent back as the assistant's own turn, the model took it as
+      // the format to answer in (#564).
+      const t = answerOf(textOf(msg.content)).trim()
       const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : []
       if (t) turns.push({ role: "assistant", content: t })
       if (calls.length) {
@@ -818,7 +822,10 @@ function stripTrailingEnvelope(text) {
       const obj = JSON.parse(tail)
       if (isActionEnvelope(obj) && raw.slice(0, idx).trim()) return raw.slice(0, idx)
     } catch {
-      /* not a whole object from here; try an earlier opening */
+      // not JSON from here: it is still the envelope when its answer was
+      // written with bare line breaks or quotes (#564); else try an earlier
+      // opening
+      if (looseEnvelopeAnswer(tail) !== null && raw.slice(0, idx).trim()) return raw.slice(0, idx)
     }
   }
   return raw
@@ -1097,6 +1104,8 @@ function createAnswerExtractor() {
     if (couldBeEnvelope(raw)) {
       if (!final) return ""
       if (isEnvelope(raw)) return unwrapAnswer(raw)
+      const loose = looseEnvelopeAnswer(raw)
+      if (loose !== null) return loose
       // Preserve the decoded prefix if upstream ended inside the answer string.
       // A closed string followed by prose is an example, so keep it verbatim.
       const start = answerStart(raw)
@@ -1171,6 +1180,71 @@ function isEnvelope(s) {
   }
 }
 
+
+/**
+ * The answer of an envelope that is not JSON, or null when `s` (all of it)
+ * isn't one.
+ *
+ * The assistant writes the envelope itself, and a long Markdown answer comes
+ * with its line breaks written as they are and its quotes left bare (#564):
+ *
+ *   {"action": "completion", "ph_1": "--", "taskCompletion": "## 结论
+ *
+ *   把 "案例模块" 改成…"}
+ *
+ * `JSON.parse` refuses that, and the whole object went out as the reply. The
+ * shape is still unmistakable: it opens with the action key, it carries
+ * `taskCompletion`, and nothing follows its closing brace. So the answer is
+ * everything from the field's opening quote to the last quote before that
+ * brace (after any short fields written after it, such as `"ph_2": "--"`),
+ * with the escapes that are there decoded and everything else kept.
+ */
+function looseEnvelopeAnswer(s) {
+  const t = String(s ?? "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim()
+  if (!/^\{\s*"action"\s*:\s*"[A-Za-z_]+"\s*,/i.test(t)) return null
+  const start = answerStart(t)
+  if (start < 0) return null
+  let body = t.slice(start)
+  const close = /\s*\}$/.exec(body)
+  if (!close) return null
+  body = body.slice(0, close.index)
+  const field = /\s*,\s*"[A-Za-z_]\w*"\s*:\s*(?:"[^"\n\\]*"|[-\w.]+)\s*$/
+  for (let m; (m = field.exec(body)); ) body = body.slice(0, m.index)
+  if (!body.endsWith('"')) return null
+  return decodeLooseString(body.slice(0, -1))
+}
+
+/** A JSON string's body as written by hand: escapes decoded, a bare quote or line break kept. */
+function decodeLooseString(s) {
+  let out = ""
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    const next = s[i + 1]
+    if (ch !== "\\" || next === undefined) {
+      out += ch
+      continue
+    }
+    if (next === "u" && /^[0-9a-f]{4}$/i.test(s.slice(i + 2, i + 6))) {
+      out += String.fromCharCode(parseInt(s.slice(i + 2, i + 6), 16))
+      i += 5
+      continue
+    }
+    // an escape JSON doesn't have (a Windows path's `\U`) stays as written
+    out += JSON_ESCAPES[next] ?? ch + next
+    i += 1
+  }
+  return out
+}
+
+/** The answer in a whole reply: the envelope's, or the reply itself when it is prose. */
+function answerOf(text) {
+  const ex = createAnswerExtractor()
+  return ex.push(String(text ?? "")) + ex.finish()
+}
 
 /**
  * Upstream error codes → the status we answer magpie with.
@@ -1389,9 +1463,11 @@ function upstreamToOpenAI(upstreamBody, { model, pacer }) {
         // The error path (skipReasoningFallback) must not — otherwise the error
         // text is pushed out by the thinking, and what the user finally sees is
         // "let me think" instead of "quota used up".
+        // Thinking can be the envelope too (#564): its answer is the text.
         if (!skipReasoningFallback && emitText === 0 && sentReasoning) {
-          push(chunk({ content: sentReasoning }))
-          emitText = sentReasoning.length
+          const text = answerOf(sentReasoning) || sentReasoning
+          push(chunk({ content: text }))
+          emitText = text.length
         }
         closed = true
         push(chunk({}, reason))
@@ -1568,7 +1644,7 @@ async function upstreamToJSON(upstreamBody, { model, pacer }) {
   const visible = extractor.push(content) + extractor.finish()
   // An empty text can't go up blank: the thinking is used first, then a note
   let finalContent = visible.trimEnd()
-  if (!finalContent && reasoning) finalContent = reasoning
+  if (!finalContent && reasoning) finalContent = answerOf(reasoning).trimEnd() || reasoning
   if (!finalContent) finalContent = "(OrcaTerm returned an empty reply)"
   const message = { role: "assistant", content: finalContent }
   if (reasoning) message.reasoning_content = reasoning
@@ -1716,6 +1792,9 @@ async function capiRequest(auth, action, data = {}) {
   }
 }
 
+// How long before a WeChat token expires magpie renews it (auth.refreshLead).
+const REFRESH_LEAD = 90 * 60 * 1000
+
 // ---- the plugin itself ------------------------------------------------------
 // The named OrcaTermAuthPlugin export is the plugin entry; _internal below is an
 // object for tests, so magpie does not call it as a second plugin.
@@ -1730,44 +1809,49 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
   }
 
   /**
-   * Each account's own state: conversation ids and temporary settings.
+   * Each account's own state: the user id each session asks as.
    * Keyed by the sign-in fingerprint rather than the provider — with several
    * accounts on magpie, none of them gets in another's way.
    */
   const sessions = new Map()
   /**
-   * Session key = account fingerprint + magpie session id.
-   * Upstream keeps conversations by conversationId, so with the account
-   * fingerprint alone, different chats on one account would share context.
-   * There is a cap as well, so signing in over and over doesn't pile up without
+   * Session key = account fingerprint + magpie session id, for the user id
+   * only. There is a cap, so signing in over and over doesn't pile up without
    * limit.
    *
-   * The conversation id is built the way the web client builds it
-   * (`generateConversationId`, module 72535): `cid-<uuid>` plus `-<assistant>`
-   * for any assistant that isn't lighthouse, plus `-<mode>` for any mode that
-   * isn't RE_ACT. This plugin always asks as orcaterm in RE_ACT, so no mode
-   * suffix.
+   * The conversation id is new on every request (#564). OrcaTerm keeps a
+   * conversation's turns by its id, and this plugin already sends the whole
+   * transcript each time, so an id used twice made upstream put its own copy
+   * of the earlier turns in front: the assistant's output protocol and its
+   * JSON envelopes. And the id was shared more widely than one chat: every
+   * request with no session id fell on "default", and magpie's conversation
+   * id is a hash of the first user turn, so two sessions that open the same
+   * way (or a title request beside its chat) shared one upstream
+   * conversation, and one session's protocol turns ended up at the end of
+   * another's.
+   *
+   * It is built the way the web client builds one (`generateConversationId`,
+   * module 72535): `cid-<uuid>` plus `-<assistant>` for any assistant that
+   * isn't lighthouse, plus `-<mode>` for any mode that isn't RE_ACT. This
+   * plugin always asks as orcaterm in RE_ACT, so no mode suffix.
    */
   const sessionFor = (auth, sid) => {
     const fp = `${fingerprint(auth)}:${sid || "default"}`
-    let s = sessions.get(fp)
-    if (!s) {
+    let userId = sessions.get(fp)
+    if (!userId) {
       if (sessions.size > 64) sessions.clear()
-      s = {
-        conversationId: `cid-${randomUUID()}-${ASSISTANT.orcaterm}`,
-        userId: uid("u-"),
-      }
-      sessions.set(fp, s)
+      userId = uid("u-")
+      sessions.set(fp, userId)
     }
-    return s
+    return { conversationId: `cid-${randomUUID()}-${ASSISTANT.orcaterm}`, userId }
   }
 
   /**
    * There is deliberately no `POST /conversation` here.
    *
    * The web client registers a conversation once and lets upstream keep the
-   * thread. This plugin cannot do the same: magpie hands every request a fresh
-   * session id, so `sessionFor` mints a new conversation id per request, and
+   * thread. This plugin cannot do the same: `sessionFor` mints a new
+   * conversation id per request (#564), and
    * registering each one filled the user's OrcaTerm history with an entry per
    * request — visible to them, and pointless, because the id is never reused.
    *
@@ -1828,6 +1912,19 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
       // "maxConcurrency is 1" describes. OrcaTerm's budget is per account and
       // shared with its own desktop client, so one in flight.
       maxConcurrency: 1,
+
+      /**
+       * How long before `expires` magpie renews the WeChat token (#675).
+       * OrcaTerm drops the OAuth session together with an expired access
+       * token: `OAuthRefreshToken` then answers SESSION_EXPIRED for good, and
+       * only a new scan helps. magpie renews when something uses the account
+       * (a request, a usage read) once the token is within this lead of
+       * expiring; the default five minutes left a 2h token renewed only by a
+       * request in its last five minutes, so an account idle past that was
+       * signed out. 90 minutes (orinsid's patch, 40+ hours with no expiry)
+       * makes anything in the last hour and a half renew it.
+       */
+      refreshLead: REFRESH_LEAD,
 
       methods: [
         {
@@ -1895,11 +1992,13 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
                   const r = await exchangeCode({ code, state })
                   // magpie writes the credential only when a `refresh` is present
                   // (host `save()`); with just a `key` it is stored as type "api"
-                  // and never renewed.
+                  // and never renewed. The refresh token is what renews it
+                  // past the access token's two hours (#675); a reply without
+                  // one falls back to renewing from the access token.
                   return {
                     type: "success",
                     access: r.accessToken,
-                    refresh: r.accessToken,
+                    refresh: r.refreshToken || r.accessToken,
                     expires: r.expiresAt ?? Date.now() + 7200 * 1000,
                     // magpie deduplicates re-sign-ins by accountId, not userId.
                     accountId: r.userId,
@@ -1934,28 +2033,43 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
 
       /**
        * Renewal. A WeChat access token lives two hours; `OAuthRefreshToken` trades
-       * it for a fresh one of the same length, so a normal session never sees an
-       * expiry.
+       * the refresh token kept at sign-in (or, for a sign-in from before 0.1.6,
+       * the access token itself) for a fresh one of the same length.
        *
        * A console cookie has nothing to renew — it lasts until the user signs out
        * of the console.
        */
       async refresh(auth) {
         const bearer = bearerOf(auth)
-        if (!bearer) return null
+        // #675: a sign-in from 0.1.6 on keeps OrcaTerm's refresh token in
+        // `refresh`, which renews after the access token's session is gone,
+        // as the desktop client does. One from before holds the access
+        // token there and renews from it until the next scan.
+        const refreshToken = looksLikeRefreshToken(auth?.refresh) ? String(auth.refresh).trim() : ""
+        if (!bearer && !refreshToken) return null
         try {
-          const r = await refreshAccessToken(bearer)
+          const r = await refreshAccessToken(bearer, { refreshToken })
           const userId = readTokenClaims(bearer).userId || auth?.userId || auth?.metadata?.userId
           return {
             key: r.accessToken,
             access: r.accessToken,
-            refresh: r.accessToken,
+            refresh: r.refreshToken || r.accessToken,
             expires: r.expiresAt ?? undefined,
             ...(userId ? { accountId: auth?.accountId || String(userId), uid: auth?.uid || String(userId), userId: String(userId) } : {}),
             metadata: { ...(auth?.metadata ?? {}), via: "wechat-qr", expires: r.expiresAt ?? undefined },
           }
         } catch (err) {
           if (/expired|invalid|失效|过期/i.test(String(err?.message ?? ""))) {
+            // A refused renewal is not a signed-out account while the token
+            // it would replace still works: the access token drives the chat
+            // by itself until its own exp (#675: SESSION_EXPIRED came 30
+            // minutes into a two-hour token). Fail without `signIn`, so
+            // magpie keeps the sign-in and tries again; a request or a 401
+            // after the real expiry still marks it.
+            const exp = Math.max(readTokenClaims(bearer).exp * 1000, Number(auth?.expires) || 0)
+            if (exp > Date.now() + 60e3) {
+              throw new Error(`OrcaTerm renewal refused, the token still has life: ${err?.message ?? err}`)
+            }
             throw Object.assign(new Error(`OrcaTerm sign-in expired, scan again: ${err?.message ?? err}`), {
               signIn: "expired",
             })
@@ -2225,16 +2339,11 @@ export const OrcaTermAuthPlugin = async ({ client } = {}) => {
 
     },
 
-    // ---- conversation header: carry magpie's session id to fetch, to split
-    // conversations upstream ---------------------------------------------------
-    // magpie's input.sessionID stays the same across the turns of one
-    // conversation, so conversationId is derived from it: different chats on one
-    // account don't share context.
-    //
-    // When magpie passes no session id — it does not for every caller — the
-    // fallback has to be steady too: a fresh id per request opened a new
-    // conversation upstream every turn and the thread was lost, while the same
-    // turns went through when the plugin was driven directly.
+    // ---- session header: carry magpie's session id to fetch ----------------
+    // It picks the user id a session's requests go up under. It no longer
+    // picks the upstream conversation: that is new on every request, since
+    // the transcript carries the thread (#564). Only this provider's requests
+    // get it; nothing is added to any other provider's.
     "chat.headers": async (input, output) => {
       if (input?.model?.providerID !== PROVIDER) return
       try {
@@ -2274,6 +2383,8 @@ export const _internal = {
   isActionEnvelope,
   appendedEnvelopeAt,
   unwrapAnswer,
+  looseEnvelopeAnswer,
+  answerOf,
   stripTrailingEnvelope,
   createAnswerExtractor,
   csrfCode,

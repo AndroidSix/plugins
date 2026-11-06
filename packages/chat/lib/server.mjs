@@ -9,11 +9,12 @@ import { join, extname, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { composeSystem, configDir, groupIcons, libraryView, providerIcons, readJson, readMcp, readProviderIcon } from "./library.mjs";
 import { chatCompletions, gatewayURL, listModels, resolveGateway, sseChunks } from "./gateway.mjs";
-import { callTool, closeAll, listTools } from "./mcp.mjs";
+import { callTool, closeAll, listTools, workspaceDir } from "./mcp.mjs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const UI_ROOT = join(here, "..", "chat");
 const MAX_TOOL_ROUNDS = 8;
+const MAX_TOOL_RESULT = 60000;
 
 // 插件版本，从包里的 package.json 读（别在两处写死同一个数字）
 const VERSION = (() => {
@@ -73,6 +74,7 @@ async function fontCss() {
 
 const DEFAULTS = {
   model: "", effort: "", system: "", instructions: [], skills: [], mcp: [],
+  mcpAll: false,    // 用 magpie Library 里的全部 MCP 服务器（以后新加的也算），不看 mcp 里勾的
   temperature: 0.7, maxTokens: 0, showReasoning: true,
   pinned: [],       // 置顶的对话 id，按置顶顺序排在列表最前
   sidebar: true,    // 左侧栏是否展开
@@ -93,6 +95,7 @@ function cleanSettings(raw) {
     instructions: Array.isArray(s.instructions) ? s.instructions.map(String) : [],
     skills: Array.isArray(s.skills) ? s.skills.map(String) : [],
     mcp: Array.isArray(s.mcp) ? s.mcp.map(String) : [],
+    mcpAll: s.mcpAll === true,
     temperature: Number.isFinite(Number(s.temperature)) ? Number(s.temperature) : 0.7,
     maxTokens: Number.isFinite(Number(s.maxTokens)) ? Number(s.maxTokens) : 0,
     showReasoning: s.showReasoning !== false,
@@ -286,7 +289,9 @@ function sse(res, type, data) {
 // 工具清单写在 system 里会和 function 定义重复一遍，所以只给一句交代。
 function toolsHint(tools) {
   if (!tools.length) return "";
-  return `# 工具\n\n你可以调用用户配置的 MCP 工具（共 ${tools.length} 个）。需要时直接调用，不要臆造结果；用不上就直接回答。`;
+  // 只说"有工作区"就够了：绝对路径会把本机用户名带进 system prompt，
+  // 而这段文字是发给模型供应商的。服务端的 cwd 已经保证相对路径落在那里。
+  return "# 工具\n\n你可以调用用户配置的 MCP 工具（共 " + tools.length + " 个）。需要时直接调用，不要臆造结果；用不上就直接回答。\n\n工具用相对路径读写文件时，落在对话页自己的工作目录里。"
 }
 
 // 工具的 schema 是提示词里最大的一块：GitHub 那 46 个工具光描述和参数就有上千万字符。
@@ -340,8 +345,16 @@ function toGatewayContent(m) {
   return parts;
 }
 
+// 这轮要用的 MCP 服务器：开了「全部」就是 Library 里的每一个加上 magpie 自己开着的（每次现读，
+// 后来在 magpie 里加的也在内），否则只用勾选的那些
+export function pickServers(servers, settings) {
+  if (settings?.mcpAll === true) return servers.slice();
+  const names = settings?.mcp || [];
+  return servers.filter((s) => names.includes(s.name));
+}
+
 // 一轮对话：可多次工具调用；把每条增量转成 SSE 发回浏览器
-async function runChat({ res, body, settings, store }, controllers) {
+async function runChat({ res, body, settings, store, options }, controllers) {
   const clientId = String(body.clientId || "");
   const abort = new AbortController();
   if (clientId) controllers.set(clientId, abort);
@@ -352,7 +365,7 @@ async function runChat({ res, body, settings, store }, controllers) {
   const effort = String(body.effort ?? settings.effort ?? "");
   const temperature = Number.isFinite(Number(body.temperature)) ? Number(body.temperature) : settings.temperature;
   const maxTokens = Number.isFinite(Number(body.maxTokens)) ? Number(body.maxTokens) : settings.maxTokens;
-  const wantTools = body.useTools !== false && (settings.mcp || []).length > 0;
+  const wantTools = body.useTools !== false && (settings.mcpAll === true || (settings.mcp || []).length > 0);
 
   const history = Array.isArray(body.messages) ? body.messages.filter((m) => m && (m.role === "user" || m.role === "assistant")) : [];
   // 只挂了图片/文件、没写文字的消息也算有内容
@@ -367,8 +380,8 @@ async function runChat({ res, body, settings, store }, controllers) {
   let tools = [];
   let toolNote = "";
   if (wantTools) {
-    const servers = await readMcp();
-    const picked = servers.filter((s) => (settings.mcp || []).includes(s.name));
+    const servers = await readMcp(undefined, options);
+    const picked = pickServers(servers, settings);
     const all = [];
     for (const s of picked) {
       try {
@@ -378,7 +391,8 @@ async function runChat({ res, body, settings, store }, controllers) {
         sse(res, "tool", { phase: "error", name: s.name, result: "无法连接 " + s.name + "：" + (err?.message || err) });
       }
     }
-    const q = String(history[history.length - 1]?.content || "").toLowerCase();
+    const last = history[history.length - 1];
+    const q = String(typeof last?.userText === "string" ? last.userText : last?.content || "").toLowerCase();
     const words = q.split(/[^a-z0-9\u4e00-\u9fff]+/).filter((w) => w.length >= 3);
     const scored = all.map((t) => {
       const hay = (t.name + " " + (t.description || "")).toLowerCase();
@@ -405,40 +419,47 @@ async function runChat({ res, body, settings, store }, controllers) {
   if (system) messages.push({ role: "system", content: system });
   for (const m of history) {
     const calls = m.role === "assistant" && Array.isArray(m.toolCalls) ? m.toolCalls.filter((c) => c && c.name) : [];
-    if (!calls.length) {
+    const rounds = m.role === "assistant" && Array.isArray(m.rounds) ? m.rounds : null;
+    if (!calls.length && !rounds) {
       messages.push({ role: m.role, content: toGatewayContent(m) });
       continue;
     }
     // 一轮工具调用的完整重放：assistant.tool_calls 后面必须跟每个调用的 tool 结果，
     // 少一条网关就拒收，所以没有结果的调用不放进历史。
     const done = calls.filter((c) => String(c.result ?? "") !== "" || c.isError);
-    if (!done.length) {
-      if (m.content) messages.push({ role: "assistant", content: String(m.content) });
-      continue;
-    }
-    messages.push({
-      role: "assistant",
-      content: m.content || "",
-      tool_calls: done.map((c, i) => ({
-        id: String(c.id || `history_${i}`),
-        type: "function",
-        function: { name: String(c.name), arguments: typeof c.args === "string" ? c.args : JSON.stringify(c.args || {}) },
-      })),
-    });
-    for (const [i, c] of done.entries()) {
+    const byId = new Map(done.map(c => [c.id, c]));
+    for (const part of rounds || [{ content: m.content }]) {
+      const partCalls = rounds ? (part.toolIds || []).map(id => byId.get(id)).filter(Boolean) : done;
+      if (!partCalls.length) {
+        if (part.content) messages.push({ role: "assistant", content: String(part.content) });
+        continue;
+      }
       messages.push({
-        role: "tool",
-        tool_call_id: String(c.id || `history_${i}`),
-        content: String(c.result ?? "").slice(0, 20000) || (c.isError ? "error" : "ok"),
+        role: "assistant",
+        content: part.content || "",
+        tool_calls: partCalls.map((c, i) => ({
+          id: String(c.id || `history_${i}`),
+          type: "function",
+          function: { name: String(c.name), arguments: typeof c.args === "string" ? c.args : JSON.stringify(c.args || {}) },
+        })),
       });
+      for (const [i, c] of partCalls.entries()) {
+        messages.push({
+          role: "tool",
+          tool_call_id: String(c.id || `history_${i}`),
+          content: String(c.result ?? "").slice(0, MAX_TOOL_RESULT) || (c.isError ? "error" : "ok"),
+        });
+      }
     }
   }
 
-  sse(res, "start", { model, tools: tools.map((t) => t.name), gateway: await resolveGateway().catch(() => gatewayURL()) });
+  sse(res, "start", { model, tools: tools.map((t) => t.name), gateway: await resolveGateway(options).catch(() => gatewayURL(options)) });
 
   let usageTotal = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  const callIds = new Set();
   try {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      sse(res, "round", {});
       const payload = { model, messages, stream: true };
       if (effort) payload.reasoning_effort = effort;
       if (Number.isFinite(temperature)) payload.temperature = temperature;
@@ -486,18 +507,27 @@ async function runChat({ res, body, settings, store }, controllers) {
       }
 
       if (calls.size && (finish === "tool_calls" || finish === "stop")) {
-        const made = [...calls.values()].filter((c) => c.name);
+        const made = [...calls.values()].filter((c) => c.name).map((c, i) => {
+          let id = c.id;
+          if (!id || callIds.has(id)) {
+            id = `call_${round}_${i}`;
+            while (callIds.has(id)) id += "_";
+          }
+          callIds.add(id);
+          return { ...c, id };
+        });
         if (!made.length) { sse(res, "done", { ms: Date.now() - started, usage: usageTotal }); res.end(); return; }
 
         messages.push({
           role: "assistant",
           content: content || "",
-          tool_calls: made.map((c, i) => ({ id: c.id || `call_${round}_${i}`, type: "function", function: { name: c.name, arguments: c.args || "{}" } })),
+          tool_calls: made.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.args || "{}" } })),
         });
         if (content) sse(res, "delta", { text: "" });
 
         for (const c of made) {
-          const id = c.id || `call_${round}`;
+          abort.signal.throwIfAborted();
+          const id = c.id;
           let args = {};
           try { args = JSON.parse(c.args || "{}"); } catch { args = {}; }
           const tool = tools.find((t) => t.name === c.name) || tools.find((t) => t.rawName === c.name);
@@ -506,7 +536,8 @@ async function runChat({ res, body, settings, store }, controllers) {
           if (!tool) {
             result = "没有这个工具：" + c.name; isError = true;
           } else {
-            const server = (await readMcp()).find((s) => s.name === tool.server);
+            const server = (await readMcp(undefined, options)).find((s) => s.name === tool.server);
+            abort.signal.throwIfAborted();
             try {
               const out = await callTool(server, tool.rawName, args);
               result = out.text; isError = Boolean(out.isError);
@@ -514,8 +545,9 @@ async function runChat({ res, body, settings, store }, controllers) {
               result = String(err?.message || err); isError = true;
             }
           }
-          sse(res, "tool", { phase: "result", id, name: c.name, args, result: String(result).slice(0, 20000), isError });
-          messages.push({ role: "tool", tool_call_id: id, content: String(result).slice(0, 60000) || (isError ? "error" : "ok") });
+          result = String(result).slice(0, MAX_TOOL_RESULT) || (isError ? "error" : "ok");
+          sse(res, "tool", { phase: "result", id, name: c.name, args, result, isError });
+          messages.push({ role: "tool", tool_call_id: id, content: result });
         }
         continue; // 让模型基于工具结果继续
       }
@@ -536,7 +568,7 @@ async function runChat({ res, body, settings, store }, controllers) {
   }
 }
 
-export async function startServer({ configDir: dirArg, options = {} } = {}) {
+export async function startServer({ configDir: dirArg, options = {}, bindTries = 12 } = {}) {
   // 调用方常传 configDir: ""；libraryView(dir = configDir()) 的默认值只在参数是
   // undefined 时生效，空字符串会让 join("", "library") 变成相对路径，指令 / 技能 /
   // MCP 全读不到。这里统一兜成真实目录。
@@ -577,7 +609,9 @@ export async function startServer({ configDir: dirArg, options = {} } = {}) {
           const settings = await store.settings();
           let list = [];
           let gatewayError = "";
-          await resolveGateway(options).catch(() => "");
+          // 把实际探测成功的网关地址报给页面
+          let gateway = "";
+          try { gateway = await resolveGateway(options); } catch { gateway = gatewayURL(options); }
           try { list = await models(options); } catch (err) { gatewayError = String(err?.message || err); }
           // 模型图标：magpie 的 providers.json 里有各供应商的 logo，能对上就带上
           try {
@@ -597,10 +631,10 @@ export async function startServer({ configDir: dirArg, options = {} } = {}) {
           return send(res, 200, {
             port,
             version: VERSION,
-            gateway: gatewayURL(options),
+            gateway,
             settings,
             models: list,
-            library: await libraryView(dir),
+            library: await libraryView(dir, options),
             error: gatewayError,
           });
         }
@@ -665,10 +699,10 @@ export async function startServer({ configDir: dirArg, options = {} } = {}) {
           const patch = await readBody(req);
           return send(res, 200, await store.saveSettings(patch));
         }
-        if (path === "/api/library" && req.method === "GET") return send(res, 200, await libraryView(dir));
+        if (path === "/api/library" && req.method === "GET") return send(res, 200, await libraryView(dir, options));
         if (path === "/api/mcp/tools" && req.method === "GET") {
           const settings = await store.settings();
-          const servers = (await readMcp(dir)).filter((s) => settings.mcp.includes(s.name));
+          const servers = pickServers(await readMcp(dir, options), settings);
           const out = [];
           for (const s of servers) {
             try {
@@ -715,7 +749,7 @@ export async function startServer({ configDir: dirArg, options = {} } = {}) {
           const body = await readBody(req);
           const settings = await store.settings();
           sseHead(res);
-          await runChat({ res, body, settings, store }, controllers);
+          await runChat({ res, body, settings, store, options }, controllers);
           return;
         }
         if (path === "/api/chat/stop" && req.method === "POST") {
@@ -771,32 +805,67 @@ export async function startServer({ configDir: dirArg, options = {} } = {}) {
 
   // 端口固定用 3477 —— 带路页写死了跳这个端口（页面 CSP 是 connect-src 'none'，
   // 没法先探测再决定跳哪，只能盲跳）。所以这里也必须是 3477，换端口页面就连不上了。
-  // 被上一次的宿主占着就等它松手，最多等 6 秒。
+  // 被上一次的宿主占着就等它松手：先等 6 秒（bindTries × 500ms），还没松手就在后台
+  // 每秒再试，直到绑上为止，不放弃。
+  //
+  // 以前等满 6 秒就抛错，这个宿主就再也没有服务了：magpie 换宿主（插件更新、
+  // 装插件、改选项）时，旧宿主手上还有调用（一条回复、一次工具调用）就会接着跑完，
+  // 最多 10 分钟，端口一直在它手里。新宿主的服务等 6 秒放弃，旧宿主随后退出，
+  // 3477 上就谁也没有了 —— 页面每个请求都是 Failed to fetch（ferock，0.1.6 自动
+  // 更新到 0.1.7 时：「保存失败」「出错：Failed to fetch」，直到重开 magpie）。
+  let closed = false;
+  const own = (p) => {
+    actualPort = p;
+    OWN = new Set([`http://127.0.0.1:${p}`, `http://localhost:${p}`]);
+    HOSTS = new Set([`127.0.0.1:${p}`, `localhost:${p}`]);
+  };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let bound = false;
-  for (let i = 0; i < 12 && !bound; i++) {
+  for (let i = 0; i < bindTries && !bound; i++) {
     try {
       await bindOn(port);
       bound = true;
     } catch (err) {
       if (err?.code !== "EADDRINUSE") throw err;
       if (i === 0) console.log(`[page-chat] ${port} 被上一次的宿主占着，等一下再绑`);
-      await new Promise((r) => setTimeout(r, 500));
+      await sleep(500);
     }
   }
-  if (!bound) throw new Error(`${port} 一直被占用，服务起不来`);
-  actualPort = server.address().port;
-  OWN = new Set([`http://127.0.0.1:${actualPort}`, `http://localhost:${actualPort}`]);
-  HOSTS = new Set([`127.0.0.1:${actualPort}`, `localhost:${actualPort}`]);
-
-  // 把实际端口写到配置目录，带路页（page/boot.js）会来读 ——
-  // 端口可能是换过的，页面不能假设永远是 3477。
-  try {
-    // dir 可能是空字符串（没传 configDir），交给 dataDir 落到默认配置目录
-    const cfgRoot = dataDir(dir);
-    writeFileSync(join(cfgRoot, "port.json"), JSON.stringify({ port: actualPort, at: Date.now() }));
-  } catch (err) {
-    console.warn("[page-chat] 端口文件写失败:", err?.message || err);
+  let ready;
+  if (bound) {
+    own(server.address().port);
+    ready = Promise.resolve(actualPort);
+  } else {
+    // 端口是固定的（0 不会被占），页面认的就是它
+    own(port);
+    console.log(`[page-chat] ${port} 还被占着：它一松手就接着绑，每秒试一次`);
+    ready = (async () => {
+      while (!closed) {
+        await sleep(1000);
+        if (closed) break;
+        try {
+          await bindOn(port);
+          own(server.address().port);
+          return actualPort;
+        } catch (err) {
+          if (err?.code !== "EADDRINUSE") throw err;
+        }
+      }
+      return 0;
+    })();
+    ready.catch(() => {});
   }
 
-  return { port: actualPort, server, store, close: async () => { await closeAll(); server.close(); } };
+  // 这里以前会写 port.json 想让带路页读实际端口，但页面 CSP 是 connect-src none，读不到。
+
+
+  // listening：现在就在听；没有的话 ready 在绑上时给出端口（关掉了就是 0）
+  return {
+    port: actualPort,
+    listening: bound,
+    ready,
+    server,
+    store,
+    close: async () => { closed = true; await closeAll(); if (server.listening) server.close(); },
+  };
 }

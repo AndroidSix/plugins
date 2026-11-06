@@ -11,6 +11,10 @@
 // claimed with the same token, on the minimax-cloud endpoints.
 
 import { createHash, randomBytes, randomUUID } from "node:crypto"
+import { readFile } from "node:fs/promises"
+import { join } from "node:path"
+import { createConnectorTools } from "./connector-tools.mjs"
+import { createWebTools } from "./web-tools.mjs"
 
 const CLIENT_ID = "mcode-public"
 const SCOPE = "agent.default"
@@ -37,6 +41,7 @@ const SITES = {
     account: "https://account.minimax.cn", // OAuth
     llm: "https://agent.minimax.cn", // chats and the model list
     agent: "https://agent.minimaxi.com", // the account and its membership
+    agentFallback: "https://agent.minimax.cn", // the same account API, when agent.minimaxi.com can't be reached
     platform: "https://www.minimaxi.com", // the M Plan's windows
   },
   "minimax-code-global": {
@@ -61,6 +66,67 @@ const num = (v) => {
   if (typeof v === "number" && Number.isFinite(v)) return v
   if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) return Number(v)
   return undefined
+}
+
+// ---- a request to one of a site's hosts ------------------------------------------
+
+// MiniMax's international hosts sit behind Akamai, which answers a request
+// from a mainland-China network with a 307 to the China site
+// (agent.minimax.io → agent.minimaxi.com, X-From: ak). The China site turns
+// the international token away ({"error":"invalid access token"}), so a
+// fetch that follows the redirect reads as a refused sign-in on every
+// call: the account card, the check-in, the chats (hetingyi, #666). The
+// two sites' tokens are not interchangeable either way.
+//
+// So every request to a site's hosts goes with redirect "manual": a
+// redirect on the same host is followed (up to five), one to another host
+// is an OtherSite, which says where it went and what to do, and is never
+// taken for a refused sign-in (no refresh is spent on it).
+class OtherSite extends Error {
+  constructor(site, what, from, to, status) {
+    const hint = site.region === "en"
+      ? `MiniMax does that for a network in mainland China; set a proxy outside mainland China for ${site.name}`
+      : `MiniMax sends some networks to its other site; set a proxy for ${site.name} on a network it serves from ${from.host}`
+    super(`${what}: ${from.host} sent the request on to ${to.host} (HTTP ${status}), which doesn't take ${site.name}'s sign-in. ${hint}.`)
+    this.from = from.host
+    this.to = to.host
+    this.status = status
+  }
+}
+
+const REDIRECTS = new Set([301, 302, 303, 307, 308])
+
+// siteFetch is fetch(url, init) for a request to one of site's hosts, with
+// a redirect to another host thrown as an OtherSite.
+async function siteFetch(site, url, init = {}, what = site.name) {
+  let at = new URL(url)
+  let method = init.method ?? "GET"
+  let body = init.body
+  for (let hop = 0; ; hop++) {
+    const res = await fetch(at.toString(), { ...init, method, body, redirect: "manual" })
+    const loc = REDIRECTS.has(res.status) ? res.headers.get("location") : null
+    if (!loc) return res
+    let next
+    try {
+      next = new URL(loc, at)
+    } catch {
+      return res
+    }
+    if (next.host !== at.host) {
+      await res.body?.cancel().catch(() => {})
+      throw new OtherSite(site, what, at, next, res.status)
+    }
+    // the same host: followed as fetch would, a body sent again only when
+    // it can be
+    const again = res.status === 307 || res.status === 308
+    if (hop >= 5 || (again && body !== undefined && body !== null && typeof body !== "string")) return res
+    await res.body?.cancel().catch(() => {})
+    if (!again && method !== "GET" && method !== "HEAD") {
+      method = "GET"
+      body = undefined
+    }
+    at = next
+  }
 }
 
 // ---- the models -------------------------------------------------------------
@@ -189,7 +255,7 @@ async function liveModels(site, access) {
   const url = new URL("/mavis/api/v1/models", site.llm)
   url.searchParams.set("region", site.region)
   url.searchParams.set("buildEnv", "prod")
-  const ask = (auth) => fetch(url, {
+  const ask = (auth) => siteFetch(site, url, {
     headers: { Accept: "application/json", ...(auth ? { Authorization: "Bearer " + auth } : {}) },
     signal: AbortSignal.timeout(10000),
   })
@@ -211,13 +277,13 @@ class OAuthError extends Error {
 
 // postForm posts an OAuth form, as MiniMax Code's client does; ok is false
 // when the answer is an HTTP error or carries an "error".
-async function postForm(url, fields, timeoutMs = 30000) {
-  const res = await fetch(url, {
+async function postForm(site, url, fields, timeoutMs = 30000) {
+  const res = await siteFetch(site, url, {
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams(fields).toString(),
     signal: AbortSignal.timeout(timeoutMs),
-  })
+  }, "sign-in")
   const text = await res.text() // preserve transport errors while reading the body
   let body
   try {
@@ -254,7 +320,7 @@ function token(body, refresh) {
 async function startDevice(site) {
   const verifier = randomBytes(32).toString("base64url")
   const challenge = createHash("sha256").update(verifier, "ascii").digest("base64url")
-  const r = await postForm(site.account + "/oauth2/device/code", {
+  const r = await postForm(site, site.account + "/oauth2/device/code", {
     client_id: CLIENT_ID,
     scope: SCOPE,
     audience: AUDIENCE,
@@ -304,7 +370,7 @@ async function pollDevice(site, d) {
     if (Date.now() >= d.deadline) break
     let r
     try {
-      r = await postForm(site.account + "/oauth2/token", {
+      r = await postForm(site, site.account + "/oauth2/token", {
         grant_type: DEVICE_GRANT,
         ...d.poll,
         client_id: CLIENT_ID,
@@ -339,7 +405,7 @@ async function pollDevice(site, d) {
 
 // refreshToken trades a refresh token for a new access token.
 async function refreshToken(site, refresh) {
-  const r = await postForm(site.account + "/oauth2/token", {
+  const r = await postForm(site, site.account + "/oauth2/token", {
     grant_type: "refresh_token",
     refresh_token: refresh,
     client_id: CLIENT_ID,
@@ -409,11 +475,55 @@ function checked(env, what) {
   return env
 }
 
+// unreached is a fetch that never got an HTTP answer: a TLS error (an
+// issuer certificate it couldn't get, an expired or unknown chain), a
+// refused or reset connection, a name that didn't resolve. A timeout or an
+// abort is not one, and neither is a redirect to the other site.
+function unreached(e) {
+  if (e instanceof OtherSite) return false
+  const name = e?.name ?? e?.cause?.name
+  return name !== "TimeoutError" && name !== "AbortError"
+}
+
+// whyUnreached is a fetch error as one line, its code first when it has
+// one (Bun puts it on the error, Node on its cause).
+function whyUnreached(e) {
+  const code = e?.code ?? e?.cause?.code
+  const msg = e?.cause?.message ?? e?.message ?? String(e)
+  return code && !String(msg).includes(code) ? `${code}: ${msg}` : String(msg)
+}
+
+// accountCall sends one call of the account API. The China site serves
+// that API on agent.minimaxi.com and on agent.minimax.cn, with the same
+// tokens and the same answers. A call agent.minimaxi.com can't be reached
+// for is sent once to agent.minimax.cn: its chain (WoTrus DV Server CA
+// under USERTrust) failed with "unable to get issuer certificate" on one
+// Windows machine for hours while agent.minimax.cn's verified
+// (youyo.p_10001, plugins#757). Only a call that got no HTTP answer goes
+// again: a 401, any other status, a business error in the body, a
+// redirect and a timeout are the answer, and are never sent twice.
 async function accountCall(site, path, opts, what) {
-  const { url, init } = signed(site, path, opts)
-  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(15000) })
+  const signal = AbortSignal.timeout(15000)
+  const origin = opts?.origin ?? site.agent
+  const send = (o) => {
+    const { url, init } = signed(site, path, { ...opts, origin: o })
+    return siteFetch(site, url, { ...init, signal }, what)
+  }
+  let res
+  try {
+    res = await send(origin)
+  } catch (e) {
+    const alt = origin === site.agent ? site.agentFallback : undefined
+    if (!alt || alt === origin || !unreached(e)) throw e
+    try {
+      res = await send(alt)
+    } catch (e2) {
+      if (!unreached(e2)) throw e2
+      throw new Error(`${what}: ${new URL(origin).host} couldn't be reached (${whyUnreached(e)}), nor ${new URL(alt).host} (${whyUnreached(e2)})`)
+    }
+  }
   if (res.status === 401 || res.status === 403) throw new AccountRefused(`${what}: the sign-in was refused (HTTP ${res.status})`, res.status)
-  if (!res.ok) throw new Error(`${what}: HTTP ${res.status}`)
+  if (!res.ok) throw Object.assign(new Error(`${what}: HTTP ${res.status}`), { status: res.status })
   let env
   try {
     env = obj(JSON.parse(await res.text()))
@@ -470,8 +580,16 @@ async function membership(site, access, userID) {
       }
     }
   } catch (e) {
-    if (e instanceof AccountRefused) throw e
-    return membershipOf(await accountCall(site, "/matrix/api/v1/commerce/get_membership_info", { access, userID, body: {} }, "membership"))
+    if (e instanceof AccountRefused || e instanceof OtherSite) throw e
+    try {
+      return membershipOf(await accountCall(site, "/matrix/api/v1/commerce/get_membership_info", { access, userID, body: {} }, "membership"))
+    } catch (e2) {
+      // neither is on this site: the international one answers both with
+      // 404 "404 page not found" (#666), so its plan is unknown, not Free,
+      // and the card goes on with the credits ledger
+      if (e.status === 404 && e2.status === 404 && !(e2 instanceof AccountRefused)) return { unknown: true }
+      throw e2
+    }
   }
   if (!ws) return {}
   try {
@@ -484,36 +602,70 @@ async function membership(site, access, userID) {
   }
 }
 
-// planWindows reads the M Plan's windows from coding_plan/remains, as
-// magpie's own MiniMax plan reader (readMiniMaxPlan) does: each model
-// group's interval and week, "general" the plan's own, the rest aside.
+// planWindows reads the plan's windows, each model group's interval and week,
+// "general" the plan's own, the rest aside. It reads the console's reply
+// (planQuota), which says what MiniMax granted this account: "24%" used of
+// "150%". Whatever a plan was given, an older plan's boost or a tier's own
+// allowance, is that total, and a total other than 100 shows as a count in
+// points ("126 / 150 %"). An item bucket counts its items.
+//
+// coding_plan/remains, the fallback, has only a whole remaining share, with
+// weekly_boost_permille beside it; its count is that share multiplied, as
+// MiniMax's CLI does, up to 1.5 points off.
+//
+// A model's window at status 3 is unlimited, and said so on "general"; both
+// at status 3 with zero totals is a bucket the plan doesn't have.
 function planWindows(body) {
   const br = obj(body?.base_resp)
   if (br && typeof br.status_code === "number" && br.status_code !== 0) throw new Error(str(br, "status_msg") ?? `MiniMax said ${br.status_code}`)
   if (!br && !Array.isArray(body?.model_remains)) throw new Error("no plan in the reply")
   const ms = (n) => (n < 1e12 ? n * 1000 : n)
   const zero = (v) => num(v) === 0
+  const pct = (v) => {
+    const n = Number.parseFloat(v)
+    return Number.isFinite(n) ? n : undefined
+  }
   const out = []
   for (const k of Array.isArray(body.model_remains) ? body.model_remains : []) {
     const name = String(k?.model_name ?? "").trim()
     if (!name || (num(k.current_interval_status) === 3 && num(k.current_weekly_status) === 3 && zero(k.current_interval_total_count) && zero(k.current_weekly_total_count))) continue
     const general = name.toLowerCase() === "general"
     for (const x of [
-      { left: num(k.current_interval_remaining_percent), status: num(k.current_interval_status) ?? 0, start: num(k.start_time) ?? 0, end: num(k.end_time) ?? 0, week: false },
-      { left: num(k.current_weekly_remaining_percent), status: num(k.current_weekly_status) ?? 0, start: num(k.weekly_start_time) ?? 0, end: num(k.weekly_end_time) ?? 0, week: true },
+      { left: num(k.current_interval_remaining_percent), status: num(k.current_interval_status) ?? 0, start: num(k.start_time) ?? 0, end: num(k.end_time) ?? 0, week: false,
+        told: pct(k.current_interval_used_percent), total: pct(k.current_interval_total_percent), items: num(k.current_interval_used_count), of: num(k.current_interval_total_count) },
+      { left: num(k.current_weekly_remaining_percent), status: num(k.current_weekly_status) ?? 0, start: num(k.weekly_start_time) ?? 0, end: num(k.weekly_end_time) ?? 0, week: true,
+        told: pct(k.current_weekly_used_percent), total: pct(k.current_weekly_total_percent) ?? (num(k.weekly_boost_permille) > 1000 ? num(k.weekly_boost_permille) / 10 : undefined), items: num(k.current_weekly_used_count), of: num(k.current_weekly_total_count) },
     ]) {
-      if (x.status === 3 || (x.left === undefined && x.status !== 2)) continue
-      const w = { used: x.status === 2 ? 100 : Math.max(0, Math.min(100, 100 - x.left)) }
+      if (x.status !== 3 && x.status !== 2 && x.left === undefined && x.told === undefined) continue
       let span = 0
       if (x.start > 0 && x.end > x.start) span = ms(x.end) - ms(x.start)
       else if (x.week) span = 7 * 86400_000
-      if (span) w.span = span / 1000
-      if (x.end > 0) w.resetsAt = new Date(ms(x.end)).toISOString()
-      w.name = x.week ? "7 days"
+      const own = x.week ? "7 days"
         : span > 86400_000 && span % 86400_000 === 0 ? `${span / 86400_000} days`
         : span >= 3600_000 && span % 3600_000 === 0 ? `${span / 3600_000} hours`
         : span > 0 ? `${Math.floor(span / 60_000)} minutes`
         : "Allowance"
+      if (x.status === 3) {
+        if (general) out.push({ name: own, display: "Unlimited", aside: true })
+        continue
+      }
+      const total = x.total > 0 ? x.total : 100
+      const used = x.status === 2 ? 100
+        : x.told !== undefined ? Math.max(0, Math.min(100, (x.told / total) * 100))
+        : Math.max(0, Math.min(100, 100 - x.left))
+      const w = { used }
+      if (span) w.span = span / 1000
+      if (x.end > 0) w.resetsAt = new Date(ms(x.end)).toISOString()
+      if (x.items >= 0 && x.of > 0 && x.items <= x.of) {
+        w.amount = x.status === 2 ? x.of : x.items
+        w.limit = x.of
+        if (name.toLowerCase() === "video") w.unit = "videos"
+      } else if (total !== 100) {
+        w.limit = total
+        w.amount = x.status === 2 ? total : x.told ?? (used * total) / 100
+        w.unit = "%"
+      }
+      w.name = own
       if (!general) {
         w.name = name[0].toUpperCase() + name.slice(1) + " · " + w.name
         w.aside = true
@@ -524,13 +676,42 @@ function planWindows(body) {
   return out
 }
 
+// magpie gives the whole usage call 20 seconds, and the console's endpoints
+// aren't documented, so a stalled one gets little of that. The fallback's 10
+// keeps planQuota within the 15 that 0.2.1 could take.
+const CONSOLE_MS = 5000
+const FALLBACK_MS = 10000
+
+// planQuota asks the console's own reply first, then coding_plan/remains.
 async function planQuota(site, access, group) {
-  const res = await fetch(site.platform + "/v1/api/openplatform/coding_plan/remains", {
-    headers: { Accept: "application/json", Authorization: "Bearer " + access, ...(group ? { "X-Group-Id": group } : {}) },
-    signal: AbortSignal.timeout(15000),
-  })
+  const headers = { Accept: "application/json", Authorization: "Bearer " + access, ...(group ? { "X-Group-Id": group } : {}) }
+  try {
+    const res = await siteFetch(site, site.platform + "/backend/account/token_plan/remains_percent", { headers, signal: AbortSignal.timeout(CONSOLE_MS) }, "M Plan")
+    if (res.ok) {
+      const body = await res.json()
+      if (Array.isArray(body?.model_remains) && body.model_remains.length && !body.base_resp?.status_code) return planWindows(body)
+    }
+  } catch {}
+  const res = await siteFetch(site, site.platform + "/v1/api/openplatform/coding_plan/remains", { headers, signal: AbortSignal.timeout(FALLBACK_MS) }, "M Plan")
   if (!res.ok) throw new Error(`M Plan: HTTP ${res.status}`)
   return planWindows(await res.json())
+}
+
+// planTitle is the subscription's name as the console says it,
+// "TokenPlanMax-年度会员"; undefined when it can't be read, and usageOf names
+// the tier instead.
+async function planTitle(site, access, group) {
+  try {
+    const res = await siteFetch(site, site.platform + "/v1/api/openplatform/charge/combo/cycle_audio_resource_package?biz_line=2&cycle_type=1&resource_package_type=7", {
+      headers: { Accept: "application/json", Authorization: "Bearer " + access, ...(group ? { "X-Group-Id": group } : {}) },
+      signal: AbortSignal.timeout(CONSOLE_MS),
+    }, "M Plan")
+    if (!res.ok) return undefined
+    const t = (await res.json())?.current_subscribe?.current_subscribe_title
+    return typeof t === "string" && t.trim() ? t.trim() : undefined
+  } catch {
+    return undefined
+  }
 }
 
 // credits says a balance as a count of credits: "1234.50" is "1234.5 credits".
@@ -608,12 +789,15 @@ function creditsWindow(batches, now = Date.now()) {
   }
 }
 
-// usageOf is the card: the plan (the M Plan's tier, else Free), the credits
-// left, and the M Plan's windows when there are any.
+// usageOf is the card: the plan (the console's title, else its tier, else
+// Free), the credits left, and the plan's windows when there are any. Plus,
+// Max and Ultra are Token Plan's tiers, which M Plan's Go, Explore and Build
+// replaced for new subscribers.
 function usageOf(m, windows = []) {
-  const plan = m.hasTokenPlan ? (m.tier ? "M Plan " + m.tier : "M Plan") : "Free"
+  const line = /^(plus|max|ultra)$/i.test(m.tier ?? "") ? "Token Plan " : "M Plan "
+  const plan = m.hasTokenPlan ? (m.title ?? (m.tier ? line + m.tier : "M Plan")) : m.unknown ? undefined : "Free"
   return {
-    plan,
+    ...(plan ? { plan } : {}),
     ...(m.hasTokenPlan && m.expiresAt ? { until: new Date(m.expiresAt < 1e12 ? m.expiresAt * 1000 : m.expiresAt).toISOString() } : {}),
     ...(m.balance !== undefined ? { balance: credits(m.balance) } : {}),
     windows,
@@ -759,49 +943,54 @@ function renew(site, a, save) {
   return r
 }
 
-function makePlugin(site) {
-  return async ({ client }) => {
-    const save = async (a) => {
-      if (typeof client?.auth?.set !== "function") return false
-      try {
-        await client.auth.set({ path: { id: site.id }, body: a })
-        return true
-      } catch {
-        return false
-      }
+function accountSession(site, client, accountID = site.id) {
+  const save = async (a) => {
+    if (typeof client?.auth?.set !== "function") return false
+    try {
+      await client.auth.set({ path: { id: accountID }, body: a })
+      return true
+    } catch {
+      return false
     }
+  }
 
-    // fresh is the account with an access token that isn't about to end,
-    // refreshed (and saved) when it is, or when MiniMax turned away the
-    // access token rejected and no newer one is had. renewed says the
-    // token isn't the one getAuth read: this call or another refreshed it.
-    const fresh = async (getAuth, rejected, again = false) => {
-      const stored = await getAuth()
-      if (stored?.type !== "oauth" || !stored.access) throw new Error(`${site.name} isn't signed in`)
-      const a = latest(site, stored)
-      const newer = a.access !== stored.access
-      if (rejected !== undefined && a.access !== rejected) return { a, renewed: true }
-      const force = rejected !== undefined
-      if (!force && !(a.expires && Date.now() >= a.expires - EARLY_MS)) return { a, renewed: newer }
-      if (!a.refresh) {
-        if (Date.now() < a.expires) return { a, renewed: newer }
+  // fresh is the account with an access token that isn't about to end,
+  // refreshed (and saved) when it is, or when MiniMax turned away the
+  // access token rejected and no newer one is had. renewed says the
+  // token isn't the one getAuth read: this call or another refreshed it.
+  const fresh = async (getAuth, rejected, again = false) => {
+    const stored = await getAuth()
+    if (stored?.type !== "oauth" || !stored.access) throw new Error(`${site.name} isn't signed in`)
+    const a = latest(site, stored)
+    const newer = a.access !== stored.access
+    if (rejected !== undefined && a.access !== rejected) return { a, renewed: true }
+    const force = rejected !== undefined
+    if (!force && !(a.expires && Date.now() >= a.expires - EARLY_MS)) return { a, renewed: newer }
+    if (!a.refresh) {
+      if (Date.now() < a.expires) return { a, renewed: newer }
+      throw new SignInExpired(site)
+    }
+    try {
+      return { a: { ...a, ...(await renew(site, a, save)) }, renewed: true }
+    } catch (e) {
+      if (signedOut(e)) {
+        // spent by someone else (magpie's renewal, another process of
+        // magpie's), who saved the new one: that one is used
+        const now = again ? undefined : await getAuth().catch(() => undefined)
+        if (now?.type === "oauth" && now.refresh && now.refresh !== a.refresh && now.refresh !== stored.refresh) return fresh(getAuth, rejected, true)
         throw new SignInExpired(site)
       }
-      try {
-        return { a: { ...a, ...(await renew(site, a, save)) }, renewed: true }
-      } catch (e) {
-        if (signedOut(e)) {
-          // spent by someone else (magpie's renewal, another process of
-          // magpie's), who saved the new one: that one is used
-          const now = again ? undefined : await getAuth().catch(() => undefined)
-          if (now?.type === "oauth" && now.refresh && now.refresh !== a.refresh && now.refresh !== stored.refresh) return fresh(getAuth, rejected, true)
-          throw new SignInExpired(site)
-        }
-        // passing: the token in hand may still do
-        if (!force && Date.now() < a.expires) return { a, renewed: newer }
-        throw Object.assign(new Error(`${site.name} token refresh: ${e?.message ?? e}`), { signIn: "kept" })
-      }
+      // passing: the token in hand may still do
+      if (!force && Date.now() < a.expires) return { a, renewed: newer }
+      throw Object.assign(new Error(`${site.name} token refresh: ${e?.message ?? e}`), { signIn: "kept" })
     }
+  }
+  return fresh
+}
+
+function makePlugin(site) {
+  return async ({ client }) => {
+    const fresh = accountSession(site, client)
 
     // one conversation id for requests that come with none of their own
     const session = randomUUID()
@@ -878,16 +1067,28 @@ function makePlugin(site) {
                 headers.set("X-Mavis-Timezone-Offset", String(new Date().getTimezoneOffset() * -60))
                 if (!headers.get("X-Mavis-Session-Id")) headers.set("X-Mavis-Session-Id", session)
                 if (!headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01")
-                return fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method ?? "POST", headers, body })
+                return siteFetch(site, req ? req.url : input instanceof URL ? input.href : input, { ...init, method: init?.method ?? req?.method ?? "POST", headers, body }, "chat")
               }
               let { a, renewed: did } = await fresh(getAuth)
-              let res = await send(a)
-              if (res.status === 401) {
-                // the token was turned away before its end: a newer one
-                // if there is one, else refreshed, and sent once more
-                ;({ a } = await fresh(getAuth, a.access))
-                did = true
+              let res
+              try {
                 res = await send(a)
+                if (res.status === 401) {
+                  // the token was turned away before its end: a newer one
+                  // if there is one, else refreshed, and sent once more
+                  ;({ a } = await fresh(getAuth, a.access))
+                  did = true
+                  res = await send(a)
+                }
+              } catch (e) {
+                // sent on to the other site: not the account's fault, so
+                // neither a refused sign-in nor a refresh
+                if (!(e instanceof OtherSite)) throw e
+                return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message: e.message } }), {
+                  status: 502,
+                  statusText: "Bad Gateway",
+                  headers: { "content-type": "application/json", "X-Magpie-Sign-In": did ? "renewed" : "kept" },
+                })
               }
               return answer(res, did)
             },
@@ -908,12 +1109,16 @@ function makePlugin(site) {
             const m = await membership(site, a.access, who.realUserID)
             let windows = []
             let error
+            let title
             if (m.hasTokenPlan && m.opGroupId) {
-              try {
-                windows = await planQuota(site, a.access, m.opGroupId)
-              } catch (e) {
-                error = e?.message ?? String(e)
-              }
+              // asked together: a stalled title costs its 5 seconds at most, not 5 more after the windows
+              ;[windows, title] = await Promise.all([
+                planQuota(site, a.access, m.opGroupId).catch((e) => {
+                  error = e?.message ?? String(e)
+                  return []
+                }),
+                planTitle(site, a.access, m.opGroupId),
+              ])
             }
             // the credits as a share of what the live batches granted
             // (#393); beside an M Plan they are its fallback, aside. A
@@ -924,7 +1129,7 @@ function makePlugin(site) {
               if (cw) windows = [...windows, m.hasTokenPlan ? { ...cw, aside: true } : cw]
             } catch {}
             return {
-              ...usageOf(m, windows),
+              ...usageOf(title ? { ...m, title } : m, windows),
               ...(error ? { error } : {}),
               user: who.email || who.name || who.realUserID,
               signIn: did ? "renewed" : "kept",
@@ -1005,8 +1210,117 @@ function makePlugin(site) {
   }
 }
 
+// Tools run outside a chat account's scope. Read the explicitly selected
+// account afresh for each call; the site's first stored account is the default.
+function createToolRequest({ client, directory }) {
+  const sessions = new Map()
+  return async (siteID, path, body, { signal, timeoutMs = 30000, account } = {}) => {
+    const site = SITES[siteID]
+    if (!site) throw new Error("unknown MiniMax Code site")
+    let id = account
+    const belongs = (key) => typeof key === "string" && (key === site.id || key.startsWith(site.id + "#") && key.length > site.id.length + 1)
+    if (id !== undefined && !belongs(id))
+      throw new Error("account must belong to the selected MiniMax Code site")
+    if (!directory) throw new Error("MiniMax tools require Magpie's config directory")
+    const abort = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])])
+    abort.throwIfAborted()
+    // Stop this tool promptly while a shared token rotation finishes and saves.
+    const wait = async (pending) => {
+      let onAbort
+      const cancelled = new Promise((_, reject) => {
+        onAbort = () => reject(abort.reason)
+        abort.addEventListener("abort", onAbort, { once: true })
+      })
+      try {
+        abort.throwIfAborted()
+        return await Promise.race([pending, cancelled])
+      } finally { abort.removeEventListener("abort", onAbort) }
+    }
+    const getAuth = async () => {
+      let store
+      try {
+        store = obj(JSON.parse(await readFile(join(directory, "plugin-auth.json"), "utf8")))
+      } catch (e) {
+        if (e.code === "ENOENT") throw new Error("Sign in to " + site.name + " in Magpie before using its tools")
+        throw new Error("MiniMax tools: Magpie's plugin-auth.json could not be read")
+      }
+      if (!store) throw new Error("MiniMax tools: invalid Magpie account store")
+      // Resolve once per call so a retry stays on the same account. The
+      // default is the one magpie's host takes for a request that names
+      // none (accountsOf): the bare site id, else the first key by name,
+      // never the order the file happens to hold them in.
+      id ??= Object.keys(store).filter(belongs).sort((x, y) => (x === site.id ? -1 : y === site.id ? 1 : x < y ? -1 : x > y ? 1 : 0))[0] ?? site.id
+      return Object.hasOwn(store, id) ? store[id] : undefined
+    }
+    await wait(getAuth())
+    if (!sessions.has(id)) sessions.set(id, accountSession(site, client, id))
+    const fresh = sessions.get(id)
+    let { a } = await wait(fresh(getAuth))
+    const secrets = new Set([a.access, a.refresh].filter(Boolean))
+    const redact = (message) => {
+      let out = String(message)
+      for (const secret of secrets) out = out.replaceAll(secret, "<redacted>")
+      return out
+    }
+    const send = (auth) => {
+      abort.throwIfAborted()
+      const req = {
+        url: new URL(path, site.llm).href,
+        init: { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "MiniMaxAgent", Authorization: "Bearer " + auth.access }, body: JSON.stringify(body) },
+      }
+      return siteFetch(site, req.url, { ...req.init, signal: abort }, site.name + " tool API")
+    }
+    try {
+      let res = await send(a)
+      // A 401 means the request was refused before execution. Transport
+      // failures and business errors are surfaced, never replayed.
+      if (res.status === 401) {
+        await res.body?.cancel()
+        ;({ a } = await wait(fresh(getAuth, a.access)))
+        secrets.add(a.access)
+        if (a.refresh) secrets.add(a.refresh)
+        res = await send(a)
+      }
+      if (!res.ok) throw new Error(site.name + " tool API: HTTP " + res.status)
+      let env
+      try { env = obj(JSON.parse(await res.text())) } catch (e) {
+        abort.throwIfAborted()
+        throw new Error("MiniMax tool API: invalid JSON response")
+      }
+      if (!env) throw new Error("MiniMax tool API: expected a JSON object")
+      // The gateway may succeed while the tool payload reports a billing
+      // or execution error. Both status layers must pass independently.
+      if (env.code !== undefined) {
+        const { code: rawCode, message, ...payload } = env
+        const code = num(rawCode)
+        if (code === undefined) throw new Error("MiniMax tool API: invalid response code")
+        if (code !== 0) throw new Error("MiniMax tool API: " + (str(env, "message") ?? "status " + code))
+        if (env.base_resp === undefined) env = { ...payload, base_resp: { status_code: code, status_msg: message } }
+      }
+      if (env.base_resp !== undefined) {
+        const br = obj(env.base_resp)
+        const code = br && num(br.status_code)
+        if (code === undefined) throw new Error("MiniMax tool API: invalid base_resp")
+        if (code !== 0) throw new Error("MiniMax tool API: " + (str(br, "status_msg") ?? "status " + code))
+      }
+      checked(env, "MiniMax tool API")
+      abort.throwIfAborted()
+      return env
+    } catch (e) {
+      abort.throwIfAborted()
+      e.message = redact(e.message)
+      throw e
+    }
+  }
+}
+
+export const MiniMaxCodeToolsPlugin = async (input) => {
+  const request = createToolRequest(input)
+  return { tool: { ...createConnectorTools(request).tool, ...createWebTools(request) } }
+}
+
 export const MiniMaxCodeAuthPlugin = makePlugin(SITES["minimax-code"])
 export const MiniMaxCodeGlobalAuthPlugin = makePlugin(SITES["minimax-code-global"])
 
 // for tests
-export const _internal = { SITES, MODELS, signed, md5, parseModels, planWindows, membershipOf, usageOf, credits, creditsWindow, ledgerBatches, variants, renewing, renewed, startDevice, pollDevice, checkinOf }
+export const _internal = { SITES, MODELS, createToolRequest, signed, md5, parseModels, planWindows, membershipOf, usageOf, credits, creditsWindow, ledgerBatches, variants, renewing, renewed, startDevice, pollDevice, checkinOf }

@@ -72,6 +72,43 @@ const THINK_OFF = new Set([
 ])
 const OFF_EFFORTS = ["none", "low", "high", "max"]
 
+// REASONING_BACK are the models the Provider API wants each earlier
+// assistant message's reasoning back from, in reasoning_content, on every
+// turn, not only a tool call's: Reflection's Beam (reflection/beam:free)
+// answers the second turn of a chat whose first reply has none 400
+// "Missing required parameter: 'messages[1].reasoning_content'", the
+// history another model made too, and takes it with something there
+// (EDwinpzy on magpie's Discord, 0.1.2717). Its list says nothing of it,
+// so any other model the Provider API asks the same of (REASONING_ASKED)
+// is asked once more with it filled, and remembered (reasoningAsked).
+const REASONING_BACK = /^reflection\/beam(?:[:-]|$)/i
+const REASONING_ASKED = /\breasoning_content\b[^"]{0,80}\b(?:missing|required|must be (?:passed|provided|included))|\b(?:missing|required)\b[^"]{0,80}\breasoning_content\b/i
+// NO_THOUGHT is the reasoning a message with none goes with: a turn
+// another model made, or one whose thinking the client kept nothing of.
+// Not blank: what is required may be read as missing when it is only
+// whitespace, and a period says nothing to the model.
+const NO_THOUGHT = "."
+const reasoningAsked = new Set()
+const wantsReasoning = (model) => REASONING_BACK.test(String(model ?? "")) || reasoningAsked.has(String(model ?? ""))
+
+// withReasoningBack is messages with each assistant message's reasoning
+// in reasoning_content: its own when it has some, the thinking it sent
+// back in reasoning, else NO_THOUGHT; the same array when none lacks it.
+function withReasoningBack(messages) {
+  if (!Array.isArray(messages)) return messages
+  let changed = false
+  const out = messages.map((m) => {
+    if (m?.role !== "assistant") return m
+    const own = m.reasoning_content
+    if (typeof own === "string" && own.trim()) return m
+    const r = typeof m.reasoning === "string" && m.reasoning.trim() ? m.reasoning : NO_THOUGHT
+    const { reasoning, ...rest } = m
+    changed = true
+    return { ...rest, reasoning_content: r }
+  })
+  return changed ? out : messages
+}
+
 // The plan's models when its list can't be asked: Claude on Messages, the
 // rest on chat completions. Pictures as models.dev has them (DeepSeek V4
 // and GLM-5.3 read text alone, so say nothing).
@@ -450,24 +487,34 @@ async function accountJSON(path, key, timeout = 15_000) {
   return res.json()
 }
 
-// The plan names, by planId prefix, the longest first, with the dollars of
-// credits each gives a month (the CLI's getPlanInfo; "individual-pro-v1"
-// is the old Pro, $80 of them).
+// The plan names, by planId prefix, the longest first, with the credits
+// each gives a month (the CLI's getPlanInfo; "individual-pro-v1" is the
+// old Pro, 80 of them), and whether those credits are usage-value units.
+// On Go, GOAT and Pro a credit is not a dollar: Command Code's usage limits
+// page (2026-10-31) says "on Go, GOAT and Pro, credits are usage-value
+// units - full-allowance models like GLM-5.2 get $1 of usage per credit,
+// and lower-allowance models draw proportionally more credits per dollar".
+// GOAT's 70 credits are the "up to $100" its pricing page says on a $100
+// model, and $70 on GLM-5.2; Pro's 80 are "up to $110" (plugins #556). The
+// windows billing/credits caps are counted in the same units (GOAT's 14
+// and 35). So the month of those plans is said in credits, not as a dollar
+// pool none of their models spends. Provider is pay as you go, $15 a
+// month for API access with no credits in it: no month of credits.
 const PLAN_NAMES = [
-  ["individual-provider", "Provider", 15],
-  ["individual-pro-v1", "Pro", 80],
-  ["individual-goat", "GOAT", 70],
+  ["individual-provider", "Provider", 0],
+  ["individual-pro-v1", "Pro", 80, "units"],
+  ["individual-goat", "GOAT", 70, "units"],
   ["individual-ultra", "Ultra", 300],
   ["individual-max", "Max", 150],
-  ["individual-pro", "Pro", 30],
-  ["individual-go", "Go", 10],
+  ["individual-pro", "Pro", 30, "units"],
+  ["individual-go", "Go", 10, "units"],
   ["teams-pro", "Teams Pro", 40],
 ]
 const NO_PLAN = "No plan"
 
 function planOf(id) {
   const s = String(id ?? "").toLowerCase().replaceAll("_", "-")
-  return PLAN_NAMES.find(([p]) => s.startsWith(p)) ?? ["", "", 0]
+  return PLAN_NAMES.find(([p]) => s.startsWith(p)) ?? ["", "", 0, ""]
 }
 
 const planName = (id) => planOf(id)[1]
@@ -539,6 +586,10 @@ function money(v) {
   return "$" + (v < 0 ? "-" : "") + s
 }
 
+// credits is an amount of usage-value credits to the cent, as money
+// rounds dollars, without the dollar sign.
+const credits = (v) => money(v).replace("$", "")
+
 // limits is the plan's 5-hour and weekly windows in a credits reply,
 // those it gives a cap.
 function limits(c) {
@@ -557,19 +608,23 @@ function limits(c) {
 }
 
 // allowanceOf makes a credits reply into the plan's windows: the 5-hour
-// and weekly limits, and the dollars as one more, used of the CLI's pool
-// (the plan's month of credits, or what is left of it if more, and the
-// bought and free ones) as its /usage bar is. The dollars, the plan's
-// whole allowance, go second, after the 5-hour window: magpie's account
-// line and menu bar show an account's first two windows, and with them
-// last the Credits bar was never there (01huadalang on Discord). A reply with neither windows
-// nor a plan tells a balance: a key's money, not an allowance. The month's
-// credits come back at until, the end of the plan's period
+// and weekly limits, and the month's credits as one more, used of the
+// CLI's pool (the plan's month of credits, or what is left of it if more,
+// and the bought and free ones) as its /usage bar is. The credits go
+// second, after the 5-hour window: magpie's account line and menu bar show
+// an account's first two windows, and with them last the Credits bar was
+// never there (01huadalang on Discord). On a plan whose credits are
+// usage-value units (Go, GOAT, Pro) the bar is the month's credits alone,
+// said as credits, and the bought and free ones, dollars at model cost
+// (the docs: "Buy extra credits at model cost"), are said beside it, not
+// added to a pool of another unit (plugins #556). A reply with neither
+// windows nor a plan tells a balance: a key's money, not an allowance. The
+// month's credits come back at until, the end of the plan's period
 // (billing/subscriptions' currentPeriodEnd), when it is known
 // (yetone/magpie#2454).
 function allowanceOf(c, until) {
   const out = { windows: limits(c) }
-  const [, name, planMonthly] = planOf(c?.credits?.planId)
+  const [, name, planMonthly, unit] = planOf(c?.credits?.planId)
   if (name) out.plan = name
   let monthly = 0
   let left = 0
@@ -582,9 +637,15 @@ function allowanceOf(c, until) {
     left += n
     known = true
   }
-  if (known && planMonthly > 0) {
+  const reset = until ? { resetsAt: until } : {}
+  if (known && planMonthly > 0 && unit === "units") {
+    const pool = Math.max(planMonthly, monthly)
+    const extra = left - monthly
+    const display = credits(pool - monthly) + " / " + credits(pool) + " credits" + (extra > 0 ? " + " + money(extra) + " extra" : "")
+    out.windows.splice(1, 0, { name: "Credits", used: Math.min(100, (100 * (pool - monthly)) / pool), display, ...reset })
+  } else if (known && planMonthly > 0) {
     const pool = Math.max(planMonthly, monthly) + left - monthly
-    out.windows.splice(1, 0, { name: "Credits", used: Math.min(100, (100 * (pool - left)) / pool), display: money(pool - left) + " / " + money(pool), ...(until ? { resetsAt: until } : {}) })
+    out.windows.splice(1, 0, { name: "Credits", used: Math.min(100, (100 * (pool - left)) / pool), display: money(pool - left) + " / " + money(pool), ...reset })
   } else if (known && !out.windows.length) out.balance = money(left)
   return out
 }
@@ -915,6 +976,66 @@ function workPlace(h) {
   return place
 }
 
+// googleSchema is a tool's parameters as Command Code's gateway takes them
+// for a Google model. It converts the schema for Google (Vertex) and
+// refuses a $ref to anything but a direct child of the root's $defs or
+// definitions: 400 AI_UnsupportedFunctionalityError "Google schema
+// conversion only supports references to direct children of root-level
+// $defs or definitions … JSON Schema reference:
+// #/properties/func/properties/triggers/items" (kthink on Discord, dsh on
+// google/gemini-3.8-flash). Such a $ref is written out in place, with the
+// notes beside it kept, and a ref to "#/$defs/x" goes as it came. A ref
+// already being written out above it (a loop) becomes its target's type
+// alone, and so does one 32 deep, so a schema that refers to itself ends.
+// A ref that names nothing is left as it came. Only a Google model gets
+// this; every other model's schema goes as it came.
+const DEF_REF = /^#\/(?:\$defs|definitions)\/[^/]+$/
+const SCHEMA_MAPS = ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]
+const SCHEMA_ONE = ["items", "additionalProperties", "contains", "propertyNames", "not", "if", "then", "else", "unevaluatedProperties", "unevaluatedItems", "contentSchema", "additionalItems"]
+const SCHEMA_LISTS = ["anyOf", "oneOf", "allOf", "prefixItems"]
+
+const isGoogle = (model) => /^google\/|(?:^|\/)gemini/i.test(String(model ?? ""))
+
+function pointerTarget(root, ref) {
+  if (ref !== "#" && !ref.startsWith("#/")) return undefined
+  let cur = root
+  for (let tok of ref.split("/").slice(1)) {
+    try {
+      tok = decodeURIComponent(tok)
+    } catch {}
+    tok = tok.replaceAll("~1", "/").replaceAll("~0", "~")
+    if (cur === null || typeof cur !== "object" || !Object.hasOwn(cur, tok)) return undefined
+    cur = cur[tok]
+  }
+  return cur
+}
+
+function googleSchema(schema) {
+  if (schema === null || typeof schema !== "object" || !JSON.stringify(schema).includes('"$ref"')) return schema
+  const root = schema
+  const walk = (s, open, depth) => {
+    if (Array.isArray(s)) return s.map((v) => walk(v, open, depth))
+    if (s === null || typeof s !== "object") return s
+    let out = s
+    if (typeof s.$ref === "string" && !(DEF_REF.test(s.$ref) && pointerTarget(root, s.$ref) !== undefined)) {
+      const t = pointerTarget(root, s.$ref)
+      if (t !== null && typeof t === "object" && !Array.isArray(t)) {
+        const { $ref, ...notes } = s
+        if (open.includes($ref) || depth >= 32) return typeof t.type === "string" ? { ...notes, type: t.type } : notes
+        return walk({ ...t, ...notes }, [...open, $ref], depth + 1)
+      }
+    }
+    out = { ...s }
+    for (const k of SCHEMA_MAPS)
+      if (out[k] && typeof out[k] === "object" && !Array.isArray(out[k]))
+        out[k] = Object.fromEntries(Object.entries(out[k]).map(([n, v]) => [n, walk(v, open, depth)]))
+    for (const k of SCHEMA_ONE) if (out[k] && typeof out[k] === "object") out[k] = walk(out[k], open, depth)
+    for (const k of SCHEMA_LISTS) if (Array.isArray(out[k])) out[k] = out[k].map((v) => walk(v, open, depth))
+    return out
+  }
+  return walk(schema, [], 0)
+}
+
 // generateBody is a chat completion request as the CLI asks
 // /alpha/generate, with no structure, branch or status behind it. The
 // working directory and whether it is a git repository are the agent's as
@@ -972,12 +1093,13 @@ function generateBody(chat, place = {}) {
     if (parts.length) messages.push({ role: "user", content: parts })
   }
   flush()
+  const google = isGoogle(chat.model)
   const tools = (chat.tools ?? [])
     .filter((t) => t?.type === "function" && t.function?.name)
     .map((t) => ({
       name: t.function.name,
       description: t.function.description ?? "",
-      input_schema: t.function.parameters ?? { type: "object", properties: {} },
+      input_schema: google ? googleSchema(t.function.parameters ?? { type: "object", properties: {} }) : t.function.parameters ?? { type: "object", properties: {} },
     }))
   const params = {
     model: chat.model,
@@ -1315,14 +1437,34 @@ async function generate(key, chat, signal, place, zdr = false) {
 // providerBody is the chat completion chat as the Provider API is sent it,
 // or undefined when it goes as it came: off, magpie's none or a client's
 // "off", is "off" for a model that turns thinking off (THINK_OFF), and
-// left out for any other, which refuses both "none" and "off" (#334).
+// left out for any other, which refuses both "none" and "off" (#334). A
+// Google model's tools have the $refs Google can't take written out
+// (googleSchema). A model that wants its reasoning back (wantsReasoning)
+// has it on each assistant message (withReasoningBack).
 function providerBody(chat) {
+  let out = chat
+  if (wantsReasoning(chat?.model)) {
+    const messages = withReasoningBack(chat.messages)
+    if (messages !== chat.messages) out = { ...chat, messages }
+  }
   const e = chat?.reasoning_effort
-  if (e !== "none" && e !== "off") return undefined
-  const out = { ...chat }
-  if (THINK_OFF.has(chat.model)) out.reasoning_effort = "off"
-  else delete out.reasoning_effort
-  return e === out.reasoning_effort ? undefined : JSON.stringify(out)
+  if ((e === "none" || e === "off") && !(e === "off" && THINK_OFF.has(chat.model))) {
+    out = { ...out }
+    if (THINK_OFF.has(chat.model)) out.reasoning_effort = "off"
+    else delete out.reasoning_effort
+  }
+  if (isGoogle(chat?.model) && Array.isArray(chat.tools)) {
+    let changed = false
+    const tools = chat.tools.map((t) => {
+      const p = t?.function?.parameters
+      const g = googleSchema(p)
+      if (g === p) return t
+      changed = true
+      return { ...t, function: { ...t.function, parameters: g } }
+    })
+    if (changed) out = { ...out, tools }
+  }
+  return out === chat ? undefined : JSON.stringify(out)
 }
 
 // systemOne asks Command Code's System One as the CLI asks it: the
@@ -1352,7 +1494,7 @@ async function systemOne(key, init, input, place, zdr) {
 
 // ---- the plugin ---------------------------------------------------------------
 
-export const _internal = { JEV, projectSlug, subsSeen, extraSeen, waits, liveKey, failure, goModels, refuses, GO_MODELS, GO_REFUSED, zdrOn }
+export const _internal = { googleSchema, isGoogle, JEV, reasoningAsked, NO_THOUGHT, projectSlug, subsSeen, extraSeen, waits, liveKey, failure, goModels, refuses, GO_MODELS, GO_REFUSED, zdrOn }
 
 export async function CommandCodePlugin({ client, magpie } = {}) {
   // isGo keeps a key as Go's, for its models and endpoint: in the
@@ -1413,16 +1555,29 @@ export async function CommandCodePlugin({ client, magpie } = {}) {
             }
             // the Provider API's answer goes on as it came, the account
             // kept, unless it is a 401 for a key whoami refuses (told)
+            const method = init.method ?? (input instanceof Request ? input.method : "POST")
             const body = chatting ? providerBody(chat) : undefined
-            const res = await (body === undefined
+            let res = await (body === undefined
               ? fetch(input, { ...init, headers })
-              : fetch(url, { ...init, method: init.method ?? (input instanceof Request ? input.method : "POST"), headers, body }))
+              : fetch(url, { ...init, method, headers, body }))
             if (res.ok) return kept(res)
+            let text = await res.text()
+            // a model asking for each earlier message's reasoning back, which
+            // its list doesn't say: it has it from now on, and this request
+            // is asked once more with it
+            if (chatting && res.status === 400 && REASONING_ASKED.test(text) && !wantsReasoning(chat?.model)) {
+              reasoningAsked.add(String(chat.model))
+              const again = providerBody(chat)
+              if (again !== undefined && again !== body) {
+                res = await fetch(url, { ...init, method, headers, body: again })
+                if (res.ok) return kept(res)
+                text = await res.text()
+              }
+            }
             // a Go key the plan wasn't known for (billing/subscriptions slow
             // or failing, nothing saved yet) is refused by the Provider API
             // (#969): it is Go from now on, and a chat completion is asked
             // again where Go is served
-            const text = await res.text()
             if (GO_NO_API.test(text)) {
               await isGo(key, (await getAuth()) ?? auth)
               if (chatting) return told(key, await generate(key, chat, init.signal, place, zdr))

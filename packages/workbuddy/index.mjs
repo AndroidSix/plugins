@@ -15,7 +15,6 @@ import { homedir } from "node:os"
 import { isAbsolute, join } from "node:path"
 import { gzipSync } from "node:zlib"
 
-const APP_VERSION = "2.0.0" // the version WorkBuddy's sign-in page is opened with
 const POLL_MS = 1000
 const SIGN_IN_MS = 5 * 60 * 1000
 const EARLY_MS = 60 * 1000 // a token this close to its end is refreshed before a request
@@ -28,7 +27,7 @@ const CN_MODELS = [
   ["hy4-preview-f", "Hy4 preview", 1000000, ["high"]],
   ["hy3", "Hy3", 192000, ["low", "high"]],
   ["hy3-x", "Hy3-X", 192000, ["low", "high"]],
-  ["deepseek-v4.1-flash", "Deepseek-V4.1-Flash", 1000000],
+  ["deepseek-v4.1-flash", "Deepseek-V4.1-Flash", 1000000, ["none", "low", "high", "max"]],
   ["glm-5.3", "GLM-5.3", 1000000, ["low", "high", "max"]],
   ["glm-5.3-flash", "GLM-5.3-Flash", 1000000, ["low", "high", "max"]],
   ["glm-5.2", "GLM-5.2", 1000000, ["high", "xhigh"]],
@@ -108,6 +107,28 @@ const SITES = {
     noImages: /^glm-/,
   },
 }
+
+// A model's context is its config's maxInputTokens, on both sites. 0.2.7
+// capped deepseek-v4.1-flash at 100000 on copilot.tencent.com from one
+// report's error ("prompt is too long: 100001 tokens > 100000 maximum"),
+// and it was wrong: on 2026-10-31 China Free-plan accounts of three other
+// users took 110,041 to 992,389-token prompts on it there, the whole prompt
+// read (needles recalled), and the vendor's own refusal of 1,157,831 named
+// 1048576 as the maximum (plugins#561). The cap made every client compact at
+// 100k. Where a prompt really is too long, WorkBuddy's 400 says "prompt is
+// too long" and goes to the client as it came (explained), which magpie
+// reads as the context overflowing (context_length_exceeded): the agent is
+// told to compact, and the account isn't rested for it.
+
+// OFF_TAKEN are models that turn thinking off for reasoning_effort "none"
+// though the config says onlyReasoning (so WorkBuddy's own client offers no
+// off switch): deepseek-v4.1-flash, and the same model under its paid id.
+// Measured 2026-10-31 on www.workbuddy.ai: "none" answered 200 with 0
+// reasoning tokens on both, where "low" thought 1221 and 1127; and on the
+// China build by the reporter of plugins#563 (0 reasoning tokens, a 30-item
+// prompt in 14s instead of 50s). Without the level magpie sends "low" for
+// a client's "none".
+const OFF_TAKEN = new Set(["deepseek-v4.1-flash", "deepseek-v4.1-flash-sg"])
 
 // textOnly says whether site drops the images sent to model, whatever its
 // config says. On 2026-10-13, with a real WorkBuddy AI account (Yirasumi on
@@ -1660,7 +1681,10 @@ function unsaid(res) {
     const c = chunkOf(ev)?.choices?.[0]
     const text = typeof c?.delta?.content === "string" ? c.delta.content : ""
     const finish = c?.finish_reason
-    if (c?.delta?.tool_calls || (text && !filterSaid(said + text))) {
+    // copilot.tencent.com sends "tool_calls": [] on every delta, text
+    // too: only a list with a call in it is one
+    const calls = c?.delta?.tool_calls
+    if ((Array.isArray(calls) ? calls.length > 0 : calls) || (text && !filterSaid(said + text))) {
       open = false
       const out = [...held, ev]
       held = []
@@ -1730,7 +1754,12 @@ async function browserSignIn(site) {
   if (!state?.state || !state?.authUrl) throw new Error(`${site.name} gave no sign-in page`)
   const url = new URL(state.authUrl)
   if (url.protocol !== "https:") throw new Error(`${site.name}'s sign-in page isn't https`)
-  url.searchParams.set("version", APP_VERSION)
+  // the desktop app's own version, as WorkBuddy desktop opens it
+  // (openAuthUrl: version = CLIENT_INFO_PLUGIN_VERSION, the app's version).
+  // The China build's page hides 企业微信 (WeCom) for a version under 5.8.0
+  // (its signin-callback chunk: platform workbuddy and version >= "5.8.0"),
+  // so the 2.0.0 sent before offered no WeCom sign-in (shenyebuwu on Discord)
+  url.searchParams.set("version", site.app)
   url.searchParams.set("loginSessionId", hex())
   return {
     url: url.toString(),
@@ -2185,8 +2214,9 @@ function capacity(v) {
 // compact is a count as magpie says one: whole, else to two places.
 const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""))
 
-// The window WorkBuddy AI rate limits its free models by, which its credit
-// meter does not show.
+// The window WorkBuddy rate limits deepseek-v4.1-flash by, which its credit
+// meter does not show: WorkBuddy AI measured at about 1e8 over ten days, the
+// China build at about 2e8 on 2026-11-02 (see CN_ESTIMATED_WINDOWS).
 //
 // A free account's usage() reports only the credits window, so a plan with
 // 160 credits untouched reads 0% while chats to deepseek-v4.1-flash are
@@ -2197,6 +2227,11 @@ const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/
 //   429 usage exceeds frequency limit, but don't worry, your usage will
 //   reset at 2026-10-20 19:47:41 UTC+8, alternatively, you can switch to
 //   the other models to continue using it.
+//
+// The China build (copilot.tencent.com) says the same in its own words:
+//
+//   429 WorkBuddy: 您的使用量已超出频率限制，将在 2026-11-02 19:17:02
+//   UTC+8 重置，您也可以切换其他模型继续使用。
 //
 // Measured on a free plan over ten days (one account, deepseek-v4.1-flash
 // only), counting in + cache_read + out:
@@ -2219,6 +2254,12 @@ const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/
 //     were seen between a reset and the next request, each opening the new
 //     window.
 //
+// The China build was measured after that, on 2026-11-02: two Free-plan
+// accounts on copilot.tencent.com, both spending the machine's ledger only
+// on this model, were refused at 200,389,043 and 200,485,923 tokens counted
+// the same way. Its cap sits at about 2e8 — and its refusals name the reset
+// in Chinese (将在 … UTC+8 重置), which windowReset reads as well.
+//
 // deepseek-v4.1-flash-sg is the same model under its paid id (the product
 // config's ModelRateLimitCap.lines[0] names it as paidId to this freeId,
 // allowPaidSwitch: true) and draws on the same window: it was refused in
@@ -2239,13 +2280,63 @@ const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/
 //     full whatever the sum says. That is the one exact signal there is,
 //     and routing must not pass over it either.
 //
+// So the sum is an estimate, and it is shown, not routed on: its card is set
+// aside (aside: true), which magpie draws beside the account and never counts
+// as its allowance. Only a refusal's card stops the model. The estimate used
+// to stop it as well, and it read a paid China account at 99% of a cap it had
+// never been refused at, with 2,457 credits left (XiaoFeiyu9, plugins#641):
+// the cap is two accounts' measurement, the ledger is one machine's, and
+// neither is the vendor's word for this account. Nothing is lost by waiting
+// for that word: magpie's gateway reads the refusal's reset ("将在 … 重置",
+// "reset at …") and its "switch to the other models", and rests this model
+// alone, on this account alone, until the time the vendor named.
+//
 // The ledger is magpie's own, in magpie's config folder (appdir.Config()):
 // the folder the plugin host runs in, which is the portable data folder
 // when magpie runs portable, $XDG_CONFIG_HOME/magpie when that is set, and
 // ~/.config/magpie otherwise. No endpoint reports the window; a ledger that
 // cannot be read yields no window rather than a made-up one.
 
-const FREE_WINDOW_CAP = 1e8
+// A window: the build's ledger rows it counts (provider and model), the cap
+// it reports against, and how its card reads. Two builds, two sets of
+// windows: the same phone number can be signed in to both, and their ledgers
+// stay apart — one build's spending must not fill the other's window.
+//
+// The China caps are measured on this machine from the vendor's own
+// refusals, never the vendor's word, and each is an estimate: 2e8 for
+// deepseek-v4.1-flash (two accounts refused at 200.39M and 200.49M on
+// 2026-11-02), with the card saying so (`~` and "(est.)"). The card is
+// shown only — set aside, plugins#641 — so a cap that goes stale costs a
+// wrong percentage, never a wrongly rested model; the first refusal of a
+// window pins the card full at the reset the vendor names.
+//
+// One entry per model, and only models that have been measured: a guessed
+// cap would read wrong every day. Add an entry when another model's window
+// is measured; remove one when the vendor stops applying it.
+const CN_ESTIMATED_WINDOWS = [
+  {
+    provider: "workbuddy",
+    model: "deepseek-v4.1-flash",
+    aliases: ["deepseek-v4.1-flash-sg"],
+    cap: 2e8,
+    name: "deepseek-v4.1-flash tokens (est.)",
+    short: "~200M",
+    // no unit: the name already says tokens, and magpie's narrow account
+    // cards cut a unit short ("tok…") beside the nine-digit numbers
+    unit: "",
+  },
+]
+// WorkBuddy AI's window keeps the name it shipped with: there the model is
+// served at x0.00, so "Free model tokens" is what it is.
+const FREE_WINDOW_AI = {
+  provider: "workbuddy-ai",
+  model: "deepseek-v4.1-flash",
+  aliases: ["deepseek-v4.1-flash-sg"],
+  cap: 1e8,
+  name: "Free model tokens",
+  short: "100M",
+  unit: "tokens",
+}
 const FREE_WINDOW_SPAN = 24 * 3600 * 1000
 // The lead: how far back of an edge the read goes on. A chain read from a row
 // that opens a window needs the window the span makes of the rows above it,
@@ -2258,12 +2349,9 @@ const FREE_WINDOW_LEAD = 86400 * 1000
 // earlier row began at most 24h before it, and so ended 24h after it at the
 // latest. This is one of the two edges the ledger itself spells out.
 const FREE_WINDOW_GAP = FREE_WINDOW_SPAN
-// the model the window is counted for; -sg shares it
-const FREE_WINDOW_MODEL = "deepseek-v4.1-flash"
-// both ids, so magpie's exact match finds the -sg one too
-const FREE_WINDOW_MODELS = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-sg"]
-// the provider whose rows count
-const FREE_WINDOW_PROVIDER = "workbuddy-ai"
+// the model a window is counted for is its spec's `model`; `aliases` are the
+// ids that share the window (-sg is the same model under its paid id), and
+// both are named in the card's models so magpie's exact match finds them
 
 // windowOffset is the UTC offset a refusal spells out, in minutes, from
 // "UTC+8", "UTC+08:00", "UTC-5" or "GMT+8". null when it spells out none,
@@ -2279,10 +2367,15 @@ function windowOffset(text) {
 }
 
 // windowReset is the instant a refusal names, or NaN when it names none or
-// names it in an offset that cannot be read.
+// names it in an offset that cannot be read. Both builds name it — WorkBuddy
+// AI in its English "will reset at …", the China build in its Chinese
+// "将在 … 重置" — with the time in the same shape, so the two patterns share
+// the group numbering and the offset below reads the "UTC+8" either way.
 function windowReset(text) {
   const s = String(text ?? "")
-  const at = /reset at (\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(s)
+  const at =
+    /reset at (\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(s) ||
+    /将在\s*(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(s)
   if (!at) return NaN
   const off = windowOffset(s)
   if (off === null) return NaN
@@ -2291,20 +2384,21 @@ function windowReset(text) {
 
 // freeWindowOf is the window account is in now, from rows (magpie's usage
 // records), or null when it has lapsed — the next request opens a new one.
-// now is passed in so the reading is testable.
+// now is passed in so the reading is testable; win is the build's window
+// (which build's rows count, what cap they fill), AI by default.
 //
 // The window is a chain: it begins at the first request answered after the
 // previous one ended, so where this window began depends on every window
 // before it. A window ends at a refusal's reset when the ledger holds one,
 // and otherwise a day after it began. readLedgerTail (which see) stops on
 // both, so that these rows read the same as the whole ledger.
-function freeWindowOf(rows, account, now = Date.now()) {
+function freeWindowOf(rows, account, now = Date.now(), win = FREE_WINDOW_AI) {
   const mine = (Array.isArray(rows) ? rows : []).filter(
     (r) =>
-      r?.provider === FREE_WINDOW_PROVIDER &&
+      r?.provider === win.provider &&
       r.providerAccount === account &&
       typeof r.model === "string" &&
-      r.model.startsWith(FREE_WINDOW_MODEL) &&
+      r.model.startsWith(win.model) &&
       r.t,
   )
   if (!mine.length) return null
@@ -2377,16 +2471,20 @@ function freeWindowOf(rows, account, now = Date.now()) {
   if (now >= end) return null // lapsed: nothing is exhausted, a new window opens on the next request
 
   const card = (amount, resetsAt, refused) => ({
-    name: "Free model tokens",
-    used: Math.min(100, (100 * amount) / FREE_WINDOW_CAP),
+    name: win.name,
+    used: Math.min(100, (100 * amount) / win.cap),
     amount,
-    limit: FREE_WINDOW_CAP,
-    unit: "tokens",
-    display: `${tokensShort(amount)} / 100M`,
+    limit: win.cap,
+    unit: win.unit,
+    display: `${tokensShort(amount)} / ${win.short}`,
     resetsAt: new Date(resetsAt).toISOString(),
     span: FREE_WINDOW_SPAN / 1000,
-    models: FREE_WINDOW_MODELS.slice(),
-    ...(refused ? { refused: true } : {}),
+    // the window's own model and the ids that share it, so magpie's exact
+    // match finds every id it limits
+    models: [win.model, ...win.aliases],
+    // the ledger's sum is an estimate, shown and set aside; the vendor's
+    // refusal is the one that stops the model (see the window above)
+    ...(refused ? { refused: true } : { aside: true }),
   })
 
   // A refusal still in force is exact: the account is spending this window
@@ -2400,7 +2498,7 @@ function freeWindowOf(rows, account, now = Date.now()) {
     if (!Number.isFinite(t) || t <= now || t <= start) continue
     if (live === null || t > live) live = t
   }
-  if (live !== null) return card(FREE_WINDOW_CAP, live, true)
+  if (live !== null) return card(win.cap, live, true)
 
   return card(used, end, false)
 }
@@ -2468,7 +2566,7 @@ function freeWindowLedger(cwd = process.cwd(), env = process.env, home = homedir
 // ledger mid-write, the one row holding the free window's start was
 // dropped without a word, and the panel showed no window at all until the
 // next read happened to succeed.
-function freeWindowRows(account, now = Date.now(), cwd = process.cwd(), env = process.env, home = homedir()) {
+function freeWindowRows(account, now = Date.now(), cwd = process.cwd(), env = process.env, home = homedir(), win = FREE_WINDOW_AI) {
   if (!account) return null
   let found = null
   for (const path of freeWindowLedger(cwd, env, home)) {
@@ -2485,11 +2583,15 @@ function freeWindowRows(account, now = Date.now(), cwd = process.cwd(), env = pr
   // way this ledger is written; one rewritten in place (a rotation or a
   // compaction) moves mtime even when its size lands the same.
   const file = path + "|" + st.mtimeMs + ":" + st.size
-  const key = file + "|" + account
+  // the key carries the account, the build and the model: one account's
+  // rows are its own, the two builds' chains over one ledger must not
+  // answer for each other (the same phone number can be signed in to both),
+  // and two windows of one build count different models
+  const key = file + "|" + win.provider + "|" + win.model + "|" + account
   if (ledgerParsed?.key === key) return ledgerParsed.rows
   let got
   try {
-    got = readLedgerTail(path, st, now, undefined, account)
+    got = readLedgerTail(path, st, now, undefined, account, win)
   } catch {
     return null
   }
@@ -2549,14 +2651,15 @@ function rowAccount(line) {
 }
 
 // ofAccount is whether a row belongs to the chain read for account: this
-// account's own row of the free model, either id. A refusal of another
-// account's, or of a paid model, says nothing about where this chain opens.
-function ofAccount(row, account) {
+// account's own row of the window's model, either id. A refusal of another
+// account's, of the other build, or of another model says nothing about
+// where this chain opens.
+function ofAccount(row, account, win = FREE_WINDOW_AI) {
   return (
-    row?.provider === FREE_WINDOW_PROVIDER &&
+    row?.provider === win.provider &&
     row.providerAccount === account &&
     typeof row.model === "string" &&
-    row.model.startsWith(FREE_WINDOW_MODEL)
+    row.model.startsWith(win.model)
   )
 }
 
@@ -2600,7 +2703,7 @@ function ofAccount(row, account) {
 // plugin_accounts.go). The label then no longer equals the accountId rows are
 // written under, no row is found for this account at all, and the card
 // reports no free window.
-function readLedgerTail(path, st, now, chunks, account) {
+function readLedgerTail(path, st, now, chunks, account, win = FREE_WINDOW_AI) {
   const CHUNK = 1 << 16
   const lapsed = now - FREE_WINDOW_SPAN // a read past this holds no window now
   const fd = openSync(path, "r")
@@ -2618,7 +2721,7 @@ function readLedgerTail(path, st, now, chunks, account) {
     let carry = ""
     let firstPass = true
     let stop = false
-    let chain = [] // this account's own rows read, latest first
+    const edge = pinning() // where this account's own rows read so far say the chain is read from
     let reach = 0 // the row below which nothing is kept: 0 until an edge is found
     let answered = false // whether an answered free-model row of it is read
 
@@ -2659,11 +2762,10 @@ function readLedgerTail(path, st, now, chunks, account) {
           if (!(firstPass && tornEnd && i === lines.length - 1)) bad++
           continue
         }
-        if (!ofAccount(row, account)) continue
+        if (!ofAccount(row, account, win)) continue
         rev.push(row)
-        chain.push(row)
         if (Number(row.status) === 200) answered = true
-        if (!reach && Number(row.status) !== 429) reach = pinned(chain, account)
+        if (!reach) reach = edge(row)
       }
       firstPass = false
     }
@@ -2674,7 +2776,7 @@ function readLedgerTail(path, st, now, chunks, account) {
       if (!reach || !Number.isFinite(t) || t >= reach) {
         try {
           const row = JSON.parse(carry)
-          if (ofAccount(row, account)) rev.push(row)
+          if (ofAccount(row, account, win)) rev.push(row)
         } catch {
           bad++
         }
@@ -2731,6 +2833,51 @@ function pinned(rows, account) {
   return 0
 }
 
+// pinning is pinned read a row at a time: it is handed the account's own
+// rows latest first, as readLedgerTail reads them, and answers each with what
+// pinned would answer for every row handed so far — in constant time.
+//
+// readLedgerTail used to call pinned on its whole chain after each row, and
+// pinned walks the chain, so a chain with no edge in it cost the square of
+// its rows: 10.5 s for 16,000 rows on mote, a minute and more for an account
+// a server spends on all day (a call a minute is 43,000 rows in a month).
+// That ran on the plugin host's one thread at every usage read, and the
+// ledger changes with every call, so nothing held it over: the host sat at
+// 99% CPU and every session through it stalled (xmoon76 on Discord, the
+// China build's window being read since 0.2.12).
+//
+// It holds because the rows only ever grow at their oldest end, and pinned
+// was asked only while it answered 0 — no readable refusal and no day's gap
+// among the rows so far — so the one new thing a row can bring is:
+//
+//   - a refusal with a readable reset: the newest such is the first read,
+//     and pinned answers it whatever else the rows hold, once a row that is
+//     not a refusal follows (readLedgerTail asked pinned for those alone);
+//   - a day's gap between it and the oldest answered row before it, the only
+//     pair of answered rows not already looked at. pinned answers that with
+//     the older row of the pair, this one.
+function pinning() {
+  let denied = null // the newest readable refusal's reset
+  let oldest = null // the oldest answered row's time so far
+  return (row) => {
+    const status = Number(row?.status)
+    if (status === 429) {
+      if (denied === null) {
+        const reset = windowReset(row.err)
+        if (Number.isFinite(reset)) denied = reset
+      }
+      return 0
+    }
+    if (denied !== null) return denied - FREE_WINDOW_LEAD
+    if (status !== 200) return 0
+    const t = Date.parse(row?.t)
+    if (!Number.isFinite(t)) return 0
+    if (oldest !== null && oldest - t >= FREE_WINDOW_GAP) return t - FREE_WINDOW_LEAD
+    oldest = t
+    return 0
+  }
+}
+
 // _internal is where these are handed to a test: magpie's host calls every
 // exported function of a plugin as one of its own factories (host.js,
 // servers()), so freeWindowRows et al. must not be exports of the plugin.
@@ -2751,22 +2898,116 @@ function pinned(rows, account) {
 // CycleRemainCapacity at all leaves the window out. TotalCredits is not a
 // fallback: an account with no packages at all keeps its unknown allowance,
 // as before, so its free models are not skipped.
-function usageOf(sum, plan) {
+//
+// The plan's own credits and the rest are two windows (akic404 on
+// Discord): summed, the gifted and activity packages' credits used long
+// ago put the card at most of its allowance on the first day of the
+// month, and the plan's pace line said nothing. "Credits" is the plan's
+// base credits and "Extra credits" every other kind, as WorkBuddy's own
+// usage panel breaks them down (Jiabubu on Discord: a plan's bonus and
+// bought credits were nowhere on the card). The summary's CreditGroups
+// say it in WorkBuddy's words: plan_base ("Plan Base Credits") is the
+// plan's, plan_bonus, addon ("Top-up Credits") and benefit ("Platform
+// Reward Credits") are extra. A summary without them is split by code as
+// the client's resolveCreditGroup does (PLAN_CODES, see planCodes). A
+// summary with only one kind keeps the one "Credits" window, as before.
+//
+// Neither of the two stops the account: WorkBuddy serves it while any
+// credits are left, of either kind. Both are set aside, and the account's
+// whole is a third window, "Total credits", which stops it (totalOf).
+// Before, the one that stopped it was the plan's until its credits were
+// spent and the extra one's after, so magpie's Routing page said the
+// plan's "500 / 500" alone on one account and the extra credits on
+// another, and an account at 90% of its plan's credits was kept for last
+// with its extra ones untouched (ferock on Discord, 0.2.22).
+function usageOf(sum, plan, site) {
   const out = { plan: plan || (sum?.IsPaidUser ? "Pro" : "Free plan"), windows: [] }
-  let total = 0, used = 0, left = 0, bags = 0
-  for (const p of sum?.Packages ?? []) {
-    const hasTotal = p?.CycleTotalCapacity != null && p.CycleTotalCapacity !== ""
-    if (hasTotal) {
-      total += capacity(p.CycleTotalCapacity)
-      used += capacity(p?.CycleUsedCapacity)
-    } else if (p?.CycleRemainCapacity != null && p.CycleRemainCapacity !== "") {
-      left += capacity(p.CycleRemainCapacity)
-      bags++
-    }
+  const { plan: mine, extra, left, bags } = kindsOf(sum, site)
+  if (mine.total > 0 && extra.total > 0) {
+    const credits = creditWindow("Credits", mine), more = creditWindow("Extra credits", extra)
+    out.windows.push(credits, more, totalOf(credits, more))
+  } else {
+    const total = mine.total + extra.total, used = mine.used + extra.used
+    if (total > 0) out.windows.push(creditWindow("Credits", { used, total }))
   }
-  if (total > 0) out.windows.push({ name: "Credits", used: (100 * used) / total, display: `${compact(used)} / ${compact(total)}`, amount: used, limit: total, unit: "credits" })
+  const total = mine.total + extra.total
   if (bags > 0 && (total === 0 || left > 0)) out.windows.push({ name: "Prepaid credits", balance: left, display: `${compact(left)} credits`, unit: "credits" })
   return out
+}
+
+// creditWindow is a window of credits used of a total.
+const creditWindow = (name, { used, total }) => ({ name, used: (100 * used) / total, display: `${compact(used)} / ${compact(total)}`, amount: used, limit: total, unit: "credits" })
+
+// totalOf is the account's whole credits, the plan's and the extra ones,
+// as the window that stops it, and sets the two aside (see usageOf). It
+// renews with the plan's (its cycle, resetsAt and span), and says the
+// soonest of the two to lapse (runsOutAt, runsOut), as routing reads no
+// window set aside.
+function totalOf(plan, extra) {
+  plan.aside = extra.aside = true
+  const w = creditWindow("Total credits", { used: plan.amount + extra.amount, total: plan.limit + extra.limit })
+  if (plan.resetsAt) w.resetsAt = plan.resetsAt
+  if (plan.span) w.span = plan.span
+  const at = (x) => (x.runsOutAt ? Date.parse(x.runsOutAt) : 0)
+  const [a, b] = [at(plan), at(extra)]
+  const soon = a > 0 && (!(b > 0) || a <= b) ? plan : b > 0 ? extra : null
+  if (soon) Object.assign(w, { runsOutAt: soon.runsOutAt, runsOut: soon.runsOut + (a > 0 && a === b ? extra.runsOut : 0) })
+  return w
+}
+
+// kindsOf is the summary's credits, the plan's and the extra ones (see
+// usageOf), and what is left in its packages with no total (a prepaid
+// balance).
+function kindsOf(sum, site) {
+  const ofPlan = planCodes(sum, site)
+  const kinds = { plan: { total: 0, used: 0 }, extra: { total: 0, used: 0 }, left: 0, bags: 0 }
+  const hasTotal = (p) => p?.CycleTotalCapacity != null && p.CycleTotalCapacity !== ""
+  const add = (k, p) => ((k.total += capacity(p.CycleTotalCapacity)), (k.used += capacity(p?.CycleUsedCapacity)))
+  const groups = (Array.isArray(sum?.CreditGroups) ? sum.CreditGroups : []).filter(hasTotal)
+  for (const g of groups) add(kinds[g?.Kind === "plan_base" ? "plan" : "extra"], g)
+  for (const p of sum?.Packages ?? []) {
+    if (hasTotal(p)) {
+      if (!groups.length) add(kinds[ofPlan(p?.PackageCode) ? "plan" : "extra"], p)
+    } else if (p?.CycleRemainCapacity != null && p.CycleRemainCapacity !== "") {
+      kinds.left += capacity(p.CycleRemainCapacity)
+      kinds.bags++
+    }
+  }
+  return kinds
+}
+
+// listedExtra is the extra credits of the detail lists (packagesOf) that
+// the summary doesn't list at all, as WorkBuddy's own usage panel counts
+// them (jiabubu on Discord, magpie 0.1.2774, a China-site free account:
+// magpie's card read "0 / 500" alone, while the panel shows the extra
+// kinds beside the plan's). The panel's groups come from the detail
+// lists, not the summary (buildCreditGroups over fetchUserResources' paid
+// and free lists), and leave out a package past its end; a slice package
+// (CapacityType 4) counts the day's slice, as resolveResourceCapacity
+// does. null when there are none with credits.
+function listedExtra(sum, packages, site, now = Date.now()) {
+  const summed = new Set((sum?.Packages ?? []).map((p) => p?.PackageCode))
+  const codes = site?.ai ? [...EXTRA_CODES, ...EXTRA_AI] : EXTRA_CODES
+  let total = 0, left = 0, at = 0, lapsing = 0
+  for (const p of packages ?? []) {
+    const code = p?.PackageCode
+    if (!codes.includes(code) || summed.has(code)) continue
+    const end = endOf(p)
+    if (end > 0 && end <= now) continue
+    const slice = String(p?.CapacityType) === SLICE ? p?.SlicePeriodUsageDetails?.[0] : null
+    const of = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0 }
+    const t = of(slice ? slice.SlicePeriodCapacitySizePrecise : p?.CycleCapacitySizePrecise)
+    const l = Math.min(t, of(slice ? slice.SlicePeriodCapacityRemainPrecise : p?.CycleCapacityRemainPrecise))
+    if (!(t > 0)) continue
+    total += t
+    left += l
+    if (l > 0 && end > 0 && !slice) {
+      if (!at || end < at) at = end, lapsing = l
+      else if (end === at) lapsing += l
+    }
+  }
+  if (!(total > 0)) return null
+  return { total, used: total - left, ...(at ? { runsOutAt: new Date(at).toISOString(), runsOut: lapsing } : {}) }
 }
 
 // enterpriseUsageOf is an enterprise (team) account's credits, from
@@ -2811,7 +3052,7 @@ async function spareFree(site, a, windows) {
 // detail list without them (10001 "PackageCodes required").
 const CODE = (n, s) => `TCACA_code_${n}_${s}`
 const PAID_CODES = [CODE("002", "AkiJS3ZHF5"), CODE("005", "maRGyrHhw1"), CODE("003", "FAnt7lcmRT"), CODE("023", "4xbGhMrE6q"),
-  CODE("026", "BaESVICNoi"), CODE("027", "0FCGVA6vSa"), CODE("009", "0XmEQc2xOf"), CODE("038", "OhvqZtiPKr"), CODE("036", "lupO5WgNdG")]
+  CODE("026", "BaESVICNoi"), CODE("027", "0FCGVA6vSa"), CODE("043", "6oIkxT7Z0S"), CODE("009", "0XmEQc2xOf"), CODE("038", "OhvqZtiPKr"), CODE("036", "lupO5WgNdG")]
 const DAILY_CODE = CODE("001", "PqouKr6QWV")
 const FREE_CODES = [DAILY_CODE, CODE("008", "cfWoLwvjU4"), CODE("035", "ArVxJcGDsm"), CODE("006", "DbXS0lrypC"), CODE("039", "KRcQj7wUat"),
   CODE("040", "mi9rCYg46x"), CODE("007", "nzdH5h4Nl0"), CODE("028", "NtpWi0jzXs"), CODE("037", "WxOD3MpI2o"), CODE("029", "6wCGEWquYy"),
@@ -2819,6 +3060,37 @@ const FREE_CODES = [DAILY_CODE, CODE("008", "cfWoLwvjU4"), CODE("035", "ArVxJcGD
 // a slice package (CapacityType 4) is refreshed each day: its credits are
 // lost at the same midnight on every account, so they tell none apart
 const SLICE = "4"
+
+// PLAN_CODES are the plan's base credits, as WorkBuddy's client (WorkBuddy
+// AI 5.9.4) groups them in its usage panel (resolveCreditGroup's
+// planBase): Pro monthly, Pro monthly plus, Pro yearly, youth, advanced,
+// flagship, buddyOneVip, the international free plan (freeMonIntl), the
+// Pro trials, and on the China build alone the free plan's monthly base
+// (freeMon, 套餐基础积分). The plan's bonus (bonus28; bonusIntl, "Plan
+// Bonus Quota") comes back each cycle too, but the client says it apart
+// (planBonus), as it does the credit packs (009, 036, 038: addon) and
+// activity, bonus29/30 and gift (benefit).
+const PLAN_CODES = [CODE("002", "AkiJS3ZHF5"), CODE("005", "maRGyrHhw1"), CODE("003", "FAnt7lcmRT"), CODE("023", "4xbGhMrE6q"),
+  CODE("026", "BaESVICNoi"), CODE("027", "0FCGVA6vSa"), CODE("043", "6oIkxT7Z0S"), CODE("035", "ArVxJcGDsm"),
+  CODE("039", "KRcQj7wUat"), CODE("040", "mi9rCYg46x")]
+const FREE_MON = CODE("008", "cfWoLwvjU4")
+
+// EXTRA_CODES are the kinds of extra credits WorkBuddy's own usage panel
+// shows beside the plan's base (WorkBuddy 5.5.6, the China build's
+// resolveCreditGroup): the plan's bonus (bonus28, bonusIntl), top-ups
+// (extra 009, extra38 038, extraIntl 036) and platform rewards (activity
+// 007, bonus29, bonus30), and on WorkBuddy AI the free month (008) and
+// gift (006) too. The China build puts gift in no group, so it shows none.
+const EXTRA_CODES = [CODE("028", "NtpWi0jzXs"), CODE("037", "WxOD3MpI2o"), CODE("009", "0XmEQc2xOf"), CODE("038", "OhvqZtiPKr"),
+  CODE("036", "lupO5WgNdG"), CODE("007", "nzdH5h4Nl0"), CODE("029", "6wCGEWquYy"), CODE("030", "BjSt89qTvr")]
+const EXTRA_AI = [FREE_MON, CODE("006", "DbXS0lrypC")]
+
+// planCodes says whether a package of the summary is the plan's own: one
+// of PLAN_CODES on that site, or the subscription the summary names.
+function planCodes(sum, site) {
+  const sub = sum?.SubscriptionPackageCode
+  return (code) => !!code && (code === sub || PLAN_CODES.includes(code) || (!site?.ai && code === FREE_MON))
+}
 
 // beijing is WorkBuddy's own time ("2026-10-13 00:39:27" is UTC+8, as its
 // DeductionEndTime for the same package says).
@@ -2862,11 +3134,12 @@ function endOf(p) {
 // packages are lost, and how many (cdredfox on X): smart routing spends
 // the account whose credits expire first. Only packages the summary
 // counts, with credits left, and not the daily slice; null when none.
-function runsOutOf(sum, packages, now = Date.now()) {
+// only narrows it to the packages of one window (the split's, usageOf).
+function runsOutOf(sum, packages, now = Date.now(), only = () => true) {
   const counted = new Set((sum?.Packages ?? []).map((p) => p?.PackageCode))
   let at = 0, amount = 0
   for (const p of packages ?? []) {
-    if (!counted.has(p?.PackageCode) || p?.PackageCode === DAILY_CODE || String(p?.CapacityType) === SLICE) continue
+    if (!counted.has(p?.PackageCode) || !only(p?.PackageCode) || p?.PackageCode === DAILY_CODE || String(p?.CapacityType) === SLICE) continue
     const left = capacity(p?.CycleCapacityRemainPrecise ?? p?.CycleCapacityRemain)
     const end = endOf(p)
     if (!(left > 0) || end <= now) continue
@@ -2924,11 +3197,19 @@ function variants(efforts) {
 
 // configModels is the site's own list as a provider's models, each on the
 // API it is served on: a Claude model on Messages, the rest on chat.
+// A model declared here (before an account's list is read, for a key
+// whose CLI reads no config, or when /v3/config can't be read) takes images
+// unless textOnly says the site drops them: both sites' configs mark every
+// model supportsImages (read 2026-11-01), and a chat to WorkBuddy AI's
+// kimi-k3 with a two-colour PNG named both colours (plugins#572). Declared
+// text-only, as before, every model read as one that can't see.
 function configModels(site) {
   return Object.fromEntries(site.models.map(([id, name, context, efforts]) => [id, {
     name,
     limit: { context, output: 0 },
     tool_call: true,
+    attachment: !textOnly(site, id),
+    modalities: { input: textOnly(site, id) ? ["text"] : ["text", "image"], output: ["text"] },
     // OpenCode (and magpie's host) read a config model's package and URL
     // from provider: { npm, api }, not api
     ...(nativeOf(site, id) ? { provider: { npm: NPM_MESSAGES, api: apiMessages(site) } } : {}),
@@ -3088,11 +3369,27 @@ function defaultEffortOf(d, efforts) {
   return typeof own === "string" && efforts.includes(own) ? own : undefined
 }
 
+// SMALL_BUDGET is the largest output budget a chat can name and still be
+// one no client meant to think in: Anthropic's API takes thinking only with
+// a budget of at least 1024 tokens and a max_tokens above it, so a request
+// of 1024 or less can't have asked for thinking there, and a client's own
+// short asks (a session title, a classification) name such budgets. A
+// default effort spends them on reasoning: itspig (#643) saw 230+ title
+// requests at max_tokens 64 on deepseek-v4-pro end out=64, reasoning=64,
+// no text. Measured 2026-11-03 on www.workbuddy.ai, deepseek-v4.1-flash-sg
+// at its default high: max_tokens 64 ended "length" with 64 reasoning
+// tokens and no text; without an effort it answered the title.
+const SMALL_BUDGET = 1024
+
 // withDefaultEffort gives a chat that names no effort the model's default
 // (defaultEffortOf), as WorkBuddy's client sends it; true when it did. An
-// effort the client named, "none" too, goes as it came.
+// effort the client named, "none" too, goes as it came. A chat whose
+// max_tokens is SMALL_BUDGET or less is given none: WorkBuddy doesn't
+// think without one, so its budget goes to the answer.
 function withDefaultEffort(chat, list) {
   if (!chat || typeof chat !== "object" || namesEffort(chat)) return false
+  const limit = chat.max_tokens ?? chat.max_completion_tokens
+  if (typeof limit === "number" && limit > 0 && limit <= SMALL_BUDGET) return false
   const m = list?.find((x) => x.id === chat.model)
   if (!m?.effort) return false
   chat.reasoning_effort = m.effort
@@ -3129,7 +3426,8 @@ async function liveModels(site, a) {
         const es = effortsOf(d, site, id)
         if (es.length) {
           const canOff = d.reasoning?.canDisableThinking
-          m.efforts = [...(!d.onlyReasoning && (canOff == null || canOff) ? ["none"] : []), ...es]
+          const off = (!d.onlyReasoning && (canOff == null || canOff)) || OFF_TAKEN.has(id)
+          m.efforts = [...(off ? ["none"] : []), ...es]
           const def = defaultEffortOf(d, es)
           if (def) m.effort = def
         }
@@ -3185,6 +3483,76 @@ function replyAfterToolsOn(b) {
   if (i === msgs.length - 1 || i < 0 || msgs[i]?.role !== "tool") return false
   msgs.splice(i + 1, 0, { role: "assistant", content: "" })
   return true
+}
+
+// HIDE_DSH is the switch, on unless the user turns it off, that takes
+// DeepSeek Harness's name out of what it sends (NancyTom on X: an account
+// used from dsh through magpie was banned, and a reply there had Tencent
+// recognize dsh's built-in prompt). FLAGGED's comma gets a chat past the
+// live 11128 check; this is for a check that reads the prompt afterwards.
+// The lines are dsh 0.2.1's own (@deepseek-ai/dsh-system-prompt and
+// dsh-harness-dev-context): the opener, the checkout and Web GUI lines in
+// the system prompt and in the runtime context dsh sends as a user message,
+// and their earlier wording (LEGACY_SOURCE, LEGACY_WEB_SURFACE). Only the
+// name in prose goes: lower-case dsh, which names paths (~/.dsh), commands,
+// URIs (dsh-session:) and skills the agent calls, stays, as does a tool's
+// result, which is what a file or command said. Case counts, so the name
+// in an identifier (DSH_HOME) is left too.
+const HIDE_DSH = "hide_dsh"
+const DSH_NAMED = [
+  [/You are an AI agent,? powered by DeepSeek Harness\.?/g, "You are an AI agent."],
+  [/DeepSeek Harness (Web GUI)/g, "$1"],
+  [/DeepSeek Harness (implementation checkout)/g, "agent $1"],
+  [/\bDSH itself\b/g, "the agent itself"],
+  [/\b([Tt]he )?DeepSeek Harness\b/g, (_, the) => (the ?? "the ") + "agent harness"],
+  [/\bDSH\b(?!_)/g, "the agent harness"],
+]
+
+function dshHidden(text) {
+  for (const [re, to] of DSH_NAMED) text = text.replace(re, to)
+  return text
+}
+
+// hideDsh puts dshHidden on the text of a chat's messages (Chat
+// Completions or Messages: a string, or a part of type text), on Messages'
+// system, and on the tools' descriptions; true when it changed any.
+// A tool's result (role tool, or a tool_result part) is left as it came.
+function hideDsh(chat) {
+  if (!chat || typeof chat !== "object") return false
+  let changed = false
+  const parts = (content) => {
+    if (typeof content === "string") {
+      const t = dshHidden(content)
+      if (t !== content) changed = true
+      return t
+    }
+    if (!Array.isArray(content)) return content
+    return content.map((p) => {
+      if (!p || typeof p.text !== "string" || (p.type !== undefined && p.type !== "text")) return p
+      const t = dshHidden(p.text)
+      if (t === p.text) return p
+      changed = true
+      return { ...p, text: t }
+    })
+  }
+  if (Array.isArray(chat.messages))
+    for (const m of chat.messages) if (m && typeof m === "object" && m.role !== "tool") m.content = parts(m.content)
+  if (chat.system !== undefined) chat.system = parts(chat.system)
+  const described = (o) => {
+    if (!o || typeof o !== "object") return
+    if (Array.isArray(o)) return o.forEach(described)
+    for (const k of Object.keys(o)) {
+      if (k === "description" && typeof o[k] === "string") {
+        const t = dshHidden(o[k])
+        if (t !== o[k]) {
+          o[k] = t
+          changed = true
+        }
+      } else described(o[k])
+    }
+  }
+  if (Array.isArray(chat.tools)) described(chat.tools)
+  return changed
 }
 
 // FREE_ONLY is the switch that keeps an account off credits (#430): its
@@ -3257,6 +3625,9 @@ function makePlugin(site) {
     }
   }
   const freeOnly = () => magpie?.option?.(site.id, FREE_ONLY) === true
+  // on by default: magpie hands over the user's value, else the default;
+  // OpenCode, with no magpie, has it on
+  const dshOff = () => magpie?.option?.(site.id, HIDE_DSH) !== false
   // onlyFree is a list with the switch on: its free models, or a failure
   // when there are none to tell (magpie then keeps the list it had)
   const onlyFree = (ms) => {
@@ -3353,6 +3724,30 @@ function makePlugin(site) {
           key: FREE_ONLY,
           label: "Free models only",
           description: `Lists only the models ${site.name} serves at no cost, and turns away a request for any other here instead of sending it, so no credits are spent. A model free only at night counts as paid.`,
+          // the same words in magpie's other languages, and that the list
+          // leaves models out while it is on (plugins#590); magpie's own
+          // fields, which an older magpie and OpenCode leave alone
+          labels: { zh: "仅免费模型", "zh-TW": "僅免費模型", ja: "無料モデルのみ", de: "Nur kostenlose Modelle" },
+          descriptions: {
+            zh: `只列出 ${site.name} 免费提供的模型；其他模型的请求在这里就被拒绝、不会发出，因此不消耗积分。只在夜间免费的模型按付费算。`,
+            "zh-TW": `只列出 ${site.name} 免費提供的模型；其他模型的請求在這裡就被拒絕、不會送出，因此不消耗積分。只在夜間免費的模型以付費計。`,
+            ja: `${site.name} が無料で提供するモデルだけを表示し、ほかのモデルへのリクエストは送信せずここで断るので、クレジットを消費しません。夜間だけ無料のモデルは有料として扱います。`,
+            de: `Listet nur die Modelle, die ${site.name} kostenlos anbietet, und weist eine Anfrage an jedes andere hier ab, statt sie zu senden, sodass keine Credits verbraucht werden. Ein Modell, das nur nachts kostenlos ist, gilt als kostenpflichtig.`,
+          },
+          filtersModels: true,
+        },
+        {
+          key: HIDE_DSH,
+          label: "Hide DeepSeek Harness's name",
+          description: `Takes DeepSeek Harness's name out of what it sends to ${site.name}: its opening line, and the lines naming its checkout and Web GUI. Paths, commands and tools stay as they are.`,
+          default: true,
+          labels: { zh: "隐去 DeepSeek Harness 的名字", "zh-TW": "隱去 DeepSeek Harness 的名字", ja: "DeepSeek Harness の名前を伏せる", de: "Namen von DeepSeek Harness ausblenden" },
+          descriptions: {
+            zh: `把 DeepSeek Harness 的名字从发给 ${site.name} 的内容里去掉：开头那句，以及说明它源码目录和 Web GUI 的几行。路径、命令和工具保持不变。`,
+            "zh-TW": `把 DeepSeek Harness 的名字從送給 ${site.name} 的內容裡去掉：開頭那句，以及說明它原始碼目錄和 Web GUI 的幾行。路徑、指令和工具保持不變。`,
+            ja: `${site.name} に送る内容から DeepSeek Harness の名前を外します。冒頭の一文と、チェックアウトや Web GUI を示す行が対象です。パス、コマンド、ツールはそのままです。`,
+            de: `Entfernt den Namen von DeepSeek Harness aus dem, was an ${site.name} gesendet wird: die erste Zeile sowie die Zeilen zu seinem Checkout und seiner Web-GUI. Pfade, Befehle und Tools bleiben unverändert.`,
+          },
         },
       ],
       async loader(getAuth) {
@@ -3394,6 +3789,7 @@ function makePlugin(site) {
             let chat, changed, names
             ;({ body, chat, changed, names } = prepared(body, native))
             if (native) names = {}
+            if (dshOff() && hideDsh(chat)) changed = true
             // the switch is checked before anything is sent: a model not
             // free, or one whose price can't be read, never reaches
             // WorkBuddy. The model is read off the chat parsed above; a body
@@ -3581,7 +3977,7 @@ function makePlugin(site) {
             }
             said = "renewed"
           }
-          const out = usageOf(sum, auth.plan)
+          const out = usageOf(sum, auth.plan, site)
           // an enterprise account's summary has no packages: its credits
           // are the enterprise meter's (#1904). A personal account's
           // refusal of it (10001 "uid or enterpriseID is empty") leaves
@@ -3596,23 +3992,57 @@ function makePlugin(site) {
           // when the plan's credits start again (cycleOf), and when the credits
           // left run out, for routing to spend them first (runsOutOf);
           // a list that can't be read leaves it unknown, the card stands
+          //
+          // Split (usageOf), the plan's cycle is the plan window's alone;
+          // the soonest credits to lapse, of any package, stay on the window
+          // that stops the account, as routing reads none set aside, and
+          // the window set aside says its own.
           const credits = out.windows.find((w) => w.name === "Credits")
+          const extra = out.windows.find((w) => w.name === "Extra credits")
           if (credits) {
             try {
               const packages = await packagesOf(site, a)
-              Object.assign(credits, cycleOf(sum, packages) ?? {}, runsOutOf(sum, packages) ?? {})
+              Object.assign(credits, cycleOf(sum, packages) ?? {})
+              const ofPlan = planCodes(sum, site)
+              if (extra) {
+                // split by the summary (usageOf): each says its own
+                // packages' soonest lapse, the whole the soonest of both
+                Object.assign(credits, runsOutOf(sum, packages, Date.now(), ofPlan) ?? {})
+                Object.assign(extra, runsOutOf(sum, packages, Date.now(), (code) => !ofPlan(code)) ?? {})
+                out.windows.splice(out.windows.findIndex((w) => w.name === "Total credits"), 1, totalOf(credits, extra))
+              } else {
+                Object.assign(credits, runsOutOf(sum, packages) ?? {})
+                // the summary of the plan's credits alone: the extra ones
+                // only the detail lists have (listedExtra) are their window,
+                // and the whole stops the account, as with the summary's
+                // split (ferock on Discord: WorkBuddy goes on serving an
+                // account at "500 / 500" on its extra credits)
+                const kinds = kindsOf(sum, site)
+                const more = kinds.plan.total > 0 && kinds.extra.total === 0 ? listedExtra(sum, packages, site) : null
+                if (more) {
+                  const { runsOutAt, runsOut, ...counts } = more
+                  const w = { ...creditWindow("Extra credits", counts), ...(runsOutAt ? { runsOutAt, runsOut } : {}) }
+                  out.windows.splice(out.windows.indexOf(credits) + 1, 0, w, totalOf(credits, w))
+                }
+              }
             } catch {}
           }
           await spareFree(site, a, out.windows)
-          // the free model's own window, which the credit meter above does
-          // not show: what actually refuses a chat long before 160 credits
-          // are spent. WorkBuddy AI alone; the China build has no such cap
-          // measured (see freeWindowOf)
-          if (site.ai) {
+          // each measured model's own window, which the credit meter above
+          // does not show: what actually refuses a chat long before the
+          // credits are spent. WorkBuddy AI has one (deepseek, 1e8, ten days
+          // of refusals); the China build's are measured one model at a time
+          // (deepseek at about 2e8, 2026-11-02), each its own card. Shown
+          // only, set aside: the vendor's refusal is what stops a model
+          // (see the window definitions above)
+          {
             const account = a.accountId || a.user || a.uid || ""
-            const rows = freeWindowRows(account)
-            const w = rows && freeWindowOf(rows, account)
-            if (w) out.windows.push(w)
+            const wins = site.ai ? [FREE_WINDOW_AI] : CN_ESTIMATED_WINDOWS
+            for (const win of wins) {
+              const rows = freeWindowRows(account, Date.now(), process.cwd(), process.env, homedir(), win)
+              const w = rows && freeWindowOf(rows, account, Date.now(), win)
+              if (w) out.windows.push(w)
+            }
           }
           return { ...out, signIn: said }
         } catch (e) {
@@ -3756,4 +4186,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { idFor, replyAfterToolsOn, withDefaultEffort, defaultEffortOf, gzipped, FREE_ONLY, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, accountName, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unsaid, FILTER_SAYS, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, REFUSED_DOC, commaPaused, commaPausedOn, opened, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, rowTime, rowAccount, ofAccount, windowOffset, windowReset, FREE_WINDOW_MODELS, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, checkinOf, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
+export const _internal = { HIDE_DSH, hideDsh, dshHidden, planCodes, listedExtra, idFor, OFF_TAKEN, replyAfterToolsOn, withDefaultEffort, SMALL_BUDGET, defaultEffortOf, gzipped, FREE_ONLY, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, accountName, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unsaid, FILTER_SAYS, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, REFUSED_DOC, commaPaused, commaPausedOn, opened, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, pinning, rowTime, rowAccount, ofAccount, windowOffset, windowReset, CN_ESTIMATED_WINDOWS, FREE_WINDOW_AI, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, checkinOf, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }

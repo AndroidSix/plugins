@@ -141,6 +141,49 @@ test("native admission: competing initial requests cannot overwrite a session re
   expect(pool.selectors.get(run.account + ":" + run.selector)).toBe(run)
 })
 
+test("native admission: a fresh user turn whose old native calls all have results gets an owner; any pending call falls back", () => {
+  const pool = new NativeSessionPool()
+  pools.push(pool)
+  const id = "call_cursor_abcdef_0_0"
+  const call = { role: "assistant", content: "", tool_calls: [{ id, type: "function", function: { name: "audit_echo", arguments: "{}" } }] }
+  const result = { role: "tool", tool_call_id: id, content: "done" }
+  const answered = [{ role: "user", content: "first" }, call, result, { role: "assistant", content: "finished" }, { role: "user", content: "next" }]
+  expect(pool.prepare("synthetic-token", { messages: answered }, "synthetic-session", registered).fallback).toBeUndefined()
+  // the old call has no result: it is pending, so the request is imported history
+  const pending = answered.filter((m) => m !== result)
+  expect(pool.prepare("synthetic-token", { messages: pending }, "synthetic-session", registered).fallback).toBe("historical native calls")
+  // a tool result with no owner here is not a fresh user turn
+  expect(pool.prepare("synthetic-token", { messages: answered.slice(0, 3) }, "synthetic-session", registered).fallback).toBe("owner unavailable")
+})
+
+test("native admission: answered native calls and new input past a held reservation get an owner that takes no reservation", () => {
+  const { pool, run } = owner()
+  const key = run.account + ":" + run.selector
+  const id = "call_cursor_abcdef_0_0"
+  const call = { role: "assistant", content: "", tool_calls: [{ id, type: "function", function: { name: "audit_echo", arguments: "{}" } }] }
+  const messages = [{ role: "user", content: "synthetic" }, call, { role: "tool", tool_call_id: id, content: "done" }, { role: "user", content: "a reminder beside the result" }]
+  const prepared = pool.prepare("synthetic-token", chat({ messages }), "synthetic-session", registered)
+  expect(prepared.fallback).toBeUndefined()
+  expect(prepared.selected).toBe(false)
+  // with no native call in its history, a request past the reservation is a branch, as before
+  expect(pool.prepare("synthetic-token", chat(), "synthetic-session", registered).fallback).toBe("owner busy")
+  // another conversation of the same account, live in the same pool
+  const another = pool.prepare("synthetic-token", chat({ messages: [{ role: "user", content: "another conversation" }] }), "another-session", registered)
+  expect(another.selected).toBe(true)
+  const other = pool.create(another, run.resolution, _internal)
+  expect(other.account).toBe(run.account)
+  expect(other.selector).not.toBe(run.selector)
+  const next = pool.create(prepared, run.resolution, _internal)
+  expect(next).not.toBeNull()
+  expect(pool.selectors.get(key)).toBe(run)
+  // the holder, still live, owes only what came before this Run; another conversation is untouched
+  expect(run.laterRunAt).toBeNumber()
+  expect(next.laterRunAt).toBeUndefined()
+  expect(other.laterRunAt).toBeUndefined()
+  pool.release(next)
+  expect(pool.selectors.get(key)).toBe(run)
+})
+
 test("native admission: completed replay entries are bounded; active entries are preserved", () => {
   const { pool, run } = owner({}, { perAccount: 2, perProcess: 2 })
   run.terminalSeen(nativeFields(message(uint(1, 0), uint(2, 0))))
@@ -417,4 +460,60 @@ test("native protocol: frames already passed on are not kept while the Run strea
   expect(refs.filter((r) => r.deref()).length).toBeLessThanOrEqual(2)
   release()
   await pending
+})
+
+// plugins#550: the quiet error says which checkpoint was last, its place in
+// the step, whether it repeated, and what came before it.
+test("native protocol: a quiet Run's error says its checkpoint was a repeat, its number and what came before (plugins#550)", async () => {
+  const { run } = owner({}, { idle: 150 })
+  const state = message(text(22, "cli"))
+  run.pump((async function* () {
+    yield* frames([update(4, text(1, "thinking")), update(4, text(1, "more")), update(1, text(1, "answer")), checkpoint(state), checkpoint(state)])
+    await new Promise(() => {})
+  })())
+  await until(() => run.error)
+  expect(run.error.message).toBe("Cursor went quiet: no message for 0 s, its last message checkpoint #2 of the Run, number 2 of step 1, 2 in a row, after thinking ×2, text (try again)")
+})
+
+test("native protocol: a checkpoint after the caller's results is the first of the next step (plugins#550)", async () => {
+  const { run } = owner({}, { idle: 150 })
+  run.quiet.checkpoints = 3
+  run.quiet.stepCheckpoints = 3
+  run.nextStep()
+  run.pump((async function* () {
+    yield* frames([checkpoint(message(text(22, "cli")))])
+    await new Promise(() => {})
+  })())
+  await until(() => run.error)
+  expect(run.error.message).toBe("Cursor went quiet: no message for 0 s, its last message checkpoint #4 of the Run, the first of step 2, after nothing else (try again)")
+})
+
+test("native protocol: Wire trace writes a failed Run, never a cancelled one, and only while on (plugins#550)", async () => {
+  const { setWireTrace } = await import("./native-session.mjs")
+  const { mkdtempSync, readdirSync, rmSync } = await import("node:fs")
+  const { tmpdir } = await import("node:os")
+  const { join } = await import("node:path")
+  const dir = mkdtempSync(join(tmpdir(), "cursor-trace-unit-"))
+  try {
+    const off = owner({}, { idle: 100 })
+    off.run.pump((async function* () { yield* frames([update(4, text(1, "x"))]); await new Promise(() => {}) })())
+    await until(() => off.run.error)
+    setWireTrace(dir)
+    const cancelled = owner()
+    await cancelled.run.cancel("the Chat response was cancelled")
+    expect(readdirSync(dir)).toEqual([])
+    const failed = owner({}, { idle: 100 })
+    failed.run.pump((async function* () { yield* frames([update(4, text(1, "x"))]); await new Promise(() => {}) })())
+    await until(() => failed.run.error)
+    expect(readdirSync(dir)).toHaveLength(1)
+  } finally {
+    setWireTrace("")
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("Wire trace: scrub takes out what could be an email, id or token (plugins#550)", async () => {
+  const { scrub } = await import("./native-session.mjs")
+  expect(scrub("Cursor said: user a.b@example.com auth0|abc123 req 0f8e4ebc-1234-4abc-9def-0123456789ab tok eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig, Team budget limit reached"))
+    .toBe("Cursor said: user <email> <account> req <id> tok <redacted>, Team budget limit reached")
 })

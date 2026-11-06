@@ -99,11 +99,21 @@ plugin's `fetch` answers them on Cursor's agent API:
 
 Tool results can continue a retained Run in the same plugin process. The owner
 uses the same session/cache key and first user message as `conversation_id`, so
-Task subagents sharing their parent's session can run independently. Retention
+Task subagents sharing their parent's session can run independently. A new
+user turn whose earlier native calls all have their results gets a retained Run
+of its own, with those calls as imported history; while any of them is still
+pending, the turn goes stateless. New input after results already given (a
+reminder Claude Code sends beside a tool result reaches the plugin as a user
+message after it) also gets a retained Run of its own while a parent Run of
+the conversation still awaits results. That Run takes no reservation and
+leaves the parent alone; only its own calls' results resume it. Retention
 waits at most 120 seconds for a result batch and 15 minutes for a Run's total
-lifetime. A continuation arriving in the last minute of that lifetime rebuilds
-from supplied history before submitting results to the old Run. The absolute
-deadline still applies to an active segment; it is never extended by activity.
+lifetime. A continuation arriving with less than 10 minutes of that lifetime
+left rebuilds from supplied history on a fresh Run before submitting results
+to the old one, since one step can be a long answer. The absolute deadline
+still applies to an active segment; it is never extended by activity. A Run
+cut by it mid-answer ends with `native Run lifetime expired: the Run timed
+out; retry your request`, words agents ask again on.
 The pool holds at most 8 owners per account and 32 per process, with
 bounded history, blobs, arguments, and pending writes. When pending writes
 reach their bound (a long history asks for its blobs at once, and a slow link
@@ -123,13 +133,18 @@ caller's tool results is bounded by the 120 seconds above instead.
 
 Cursor's count of a step's tool calls includes calls the plugin answers itself:
 a tool the request doesn't have is refused to the model, and Cursor's own
-`get_mcp_tools` is answered with the request's tools. The step's calls are the
-rest.
+`get_mcp_tools` is answered with the request's tools. It also includes calls
+Cursor completes by itself, which it writes and completes in the step but never
+starts on the client or sends to it; those count toward it too. When the count
+comes after the step's calls, a checkpoint whose state waits on exactly the
+calls the caller was given also ends the step (#550); a checkpoint between
+calls after a count sent ahead of them does not seal the batch early. The
+step's calls are the rest.
 
 These are retention limits. A missing, expired, restarted, busy, incompatible,
 or full owner uses the original history reconstruction and stateless decoder
-on a new Run. Pending parent calls and new input can take that path without
-cancelling the parent's owner. Already supplied client tool results become
+on a new Run. Pending parent calls can take that path without cancelling the
+parent's owner. Already supplied client tool results become
 history; the plugin never executes those external tools. A failed native result
 write is reported to that request because its outcome may be uncertain. A later
 request can rebuild from its supplied history without submitting the result to
@@ -137,8 +152,9 @@ the old native exec again.
 
 A native tool handoff reports zero usage with `magpie_native.accounting=pending`;
 the final native answer bills the turn's totals. Its own `prompt_tokens` and
-`completion_tokens` are its last model call's share (the larger of that
-call's prompt estimate and the turn's mean per call), since a client reads
+`completion_tokens` are its last model call's count (`ModelCallCompletedUpdate`,
+asked for with `emit_model_call_usage`, else the larger of that call's prompt
+estimate and the turn's mean per call), since a client reads
 them as how full its context is; the earlier calls' share is
 `usage.magpie_deferred` (#156). An identical completed retry
 replays the saved response with zero usage. A native final also collects earlier
@@ -146,12 +162,22 @@ stateless debt as `usage.magpie_deferred`, separately from its own prompt total.
 If a started native Run is abandoned after a pending handoff, its dashboard
 count is owed once to the same account and conversation. Successful final
 snapshots, including explicit zero, and cached replays do not enroll that debt.
+A Run still awaiting results when a later native Run of its conversation
+starts owes that count at once, for the later Run to collect, rather than at
+abandonment; what it had collected and not given out goes along. Cursor adds
+each step to a Run's one event as the step ends, so that event is looked for
+only `owedAt` (5 seconds) after the handover; a final waits for it. If its own
+results resume it after all, a count not collected yet is withdrawn, and one
+already collected comes off its final (from the earlier calls' share first),
+so the event is billed once.
 
 Dashboard attribution uses event timestamps, rather than when events arrive.
 Older debt is bounded strictly before the native Run's start, and keeps that
 bound across later stateless Runs so an authoritative native event is not
-billed again. An earlier event stamped on or after that boundary cannot be
-identified reliably and stays unknown. Missing or ambiguous debt expires after
+billed again. A Run abandoned after a later native Run of its conversation
+started owes with the same bound, before that later start. An earlier event
+stamped on or after that boundary cannot be identified reliably and stays
+unknown. Missing or ambiguous debt expires after
 10 minutes; at most 64 distinct bounded debt groups are kept per account and
 conversation, dropping the oldest on overflow. These counts are never guessed
 as prior usage. Stateless Runs otherwise keep the dashboard accounting above.
@@ -202,17 +228,36 @@ minutes), the way pi-cursor-sdk lists Cursor's catalog:
   has. A model the usable list has nothing of is the picker's alone
   (GLM-5.3) and is kept whole; so is every model when Cursor can't give
   the usable list.
-- A family the usable list has and the picker doesn't (an account whose
-  picker lacks Claude Opus 5.5 while `cursor-agent models` lists
-  `claude-opus-5-5-low` to `-max`) is listed once under its family id
-  (`claude-opus-5-5`), its efforts as variants, and goes as the usable id
-  those parameters pick, never as the family id Cursor doesn't know. A
-  picker model whose chosen variant isn't one the account can use goes as
-  its family's nearest usable id the same way. Such a family is named
-  without the tier Cursor's names carry ("Claude Opus 5 1M Medium
-  Thinking" is listed as Claude Opus 5 Thinking): the tier is the
-  reasoning level the agent asks for (low to max, as the account has
-  them), fast the request's `service_tier`.
+- The full catalog (`AvailableModels` with `scope: 3`, asked alongside the
+  other two; it also lists the models Cursor hides from an account, Claude
+  from a Pro one) supplies the Anthropic models the picker lacks: each live
+  one (not `isHidden`, not Auto, not chat-only or Tab-only) with a variant
+  the usable list has an id for is listed as the picker's models are, once
+  for each context size (`claude-opus-5-5@300k`, `claude-opus-5-5@1m`; name
+  "Claude Opus 5.5 @ 300k"), thinking a parameter, the efforts the account
+  is served, and the larger size in Max Mode with that `context`. A catalog
+  variant without its own id gets the one of the model's ids that says its
+  effort, thinking and fast; with none or several it is not offered. Only
+  the parameters the model defines are sent (the catalog's variants also
+  carry `cyber=false`, which the picker's don't and cursor-agent never
+  sends). With no effort asked, a model goes at Cursor's default variant
+  (Opus 5 and 4.8: high), as the picker's models do, not at medium as the
+  fallback entries did. The picker's models and every model that is not
+  Anthropic's don't change.
+  An id saved from an earlier list (`claude-opus-5-5`,
+  `claude-opus-4-8-thinking@1m`) runs as the model at the nearest size it
+  has, as a usable id.
+- When Cursor can't give the catalog, a family the usable list has and the
+  picker doesn't (`claude-opus-5-5-low` to `-max`) is listed once under its
+  family id (`claude-opus-5-5`), its efforts as variants, and goes as the
+  usable id those parameters pick, never as the family id Cursor doesn't
+  know; it has no window in the usable list, so 200K is assumed. A picker
+  model whose chosen variant isn't one the account can use goes as its
+  family's nearest usable id the same way. Such a family is named without
+  the tier Cursor's names carry ("Claude Opus 5 1M Medium Thinking" is
+  listed as Claude Opus 5 Thinking): the tier is the reasoning level the
+  agent asks for (low to max, as the account has them), fast the request's
+  `service_tier`.
 - An id for a model with thinking that the account lists only without it
   (`claude-haiku-5-5-thinking` when the list has Claude Haiku 5.5 alone),
   or the other way round, runs as the model the account has. So does a
@@ -297,6 +342,30 @@ models to the next account until the period resets, even when on-demand
 could still pay for them. On-demand and Total are still shown but never
 keep an account in routing. Use it when on-demand is a shared or paid pool
 you don't want spent. When off, on-demand works as described above.
+
+### Wire trace (optional, for bug reports)
+
+In magpie, open the Cursor provider, turn on **Wire trace** under **Plugin
+options**, and save (or set `"pluginOptions": {"cursor": {"wire_trace":
+true}}` in magpie's settings.json). It is off by default and takes effect
+at the next request.
+
+When on, each Cursor request that fails (not one you cancel) saves a JSON
+file in the `cursor-traces` folder of magpie's folder: `~/.config/magpie/cursor-traces`
+(on Windows `C:\Users\<you>\.config\magpie\cursor-traces`), or the
+portable data folder. The newest 20 are kept. A file holds the Run's
+frames in order, both ways, as each frame's time (ms from the Run's
+start), size, kind (text, thinking, checkpoint, heartbeat, ...), field
+numbers and sizes, and the field numbers and sizes one level inside them,
+plus the error and the model id. A few of Cursor's numbers are kept too: a
+tool count's value, which kind of call (the field number of Cursor's tool
+call) a call update is about, how many calls a checkpoint waits on, and,
+for a Run that went without the native session, why. No prompt, reply or thinking text, tool
+name or argument, blob or checkpoint content, token, header, account or
+conversation id is written; the error's message has anything shaped like
+an email, id or token taken out. Look the file over before you attach it.
+
+Turn it off again when you're done.
 
 Sign in to the Cursor account linked in Grok Bot. A linked SuperGrok
 subscription grants Bot access without a paid Cursor plan; see

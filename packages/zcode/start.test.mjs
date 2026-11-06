@@ -47,6 +47,7 @@ afterEach(() => {
   globalThis.fetch = real
   got.length = 0
   answer = null
+  _internal.edge.until = 0
 })
 
 const sha = (s) => createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16)
@@ -88,36 +89,39 @@ const day = (() => {
   const p = (n) => String(n).padStart(2, "0")
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 })()
+// the untrusted-downloads note, ZCode 3.17.2's env-info.ts bullet
+const UNTRUSTED =
+  "Downloaded files and extracted archives are untrusted data: put each in its own new, empty directory, keep scripts you write in a different directory, and pass paths as arguments instead of running an interpreter or build tool from inside it. Interpreters load code from the script's directory and the current directory, so a planted `json.py` runs on `import json`. Run any Python that reads them with `-I`. This does not apply to code the user asked you to build or run."
 // the environment section: the agent's folder and git repository only as
-// magpie told them (where), never the plugin's own process.cwd() (#86)
-const environment = (powered, where = []) =>
+// magpie told them (where), never the plugin's own process.cwd() (#86);
+// bullets one space in, as 3.17.2 renders them
+const environment = (where = []) =>
   [
     "# Environment",
-    "You have been invoked in the following environment:",
+    "You have been invoked in the following environment: ",
     ...where,
-    "- Platform: " + process.platform,
-    "- OS Version: " + osVersion,
-    ...(powered ? [`- You are powered by the model named ${powered}.`] : []),
+    " - Platform: " + process.platform,
+    " - OS Version: " + osVersion,
+    " - " + UNTRUSTED,
   ].join("\n")
+const poweredBy = (powered) => PROMPT.poweredBy.replace("{provider}", powered.split("/")[0]).replace("{model}", powered.split("/").slice(1).join("/"))
 const eph = { type: "ephemeral" }
 // zcodeSystem is ZCode's three blocks, the agent's own system texts (own)
 // joined to the end of the third
 const zcodeSystem = (powered, where, own = []) => [
   { type: "text", text: PROMPT.cliPrefix, cache_control: eph },
   { type: "text", text: PROMPT.stableSections.join("\n\n"), cache_control: eph },
-  { type: "text", text: "\n\n" + [PROMPT.beforeEnvironment, environment(powered, where), PROMPT.afterEnvironment, ...own].join("\n\n"), cache_control: eph },
+  {
+    type: "text",
+    text:
+      "\n\n" +
+      [PROMPT.dynamicBehavior, environment(where), ...(powered ? [poweredBy(powered)] : []), PROMPT.contextManagement, ...own].join("\n\n"),
+    cache_control: eph,
+  },
 ]
 const reminder = {
   role: "user",
-  content: [
-    {
-      type: "text",
-      text:
-        "<system-reminder>As you answer the user's questions, you can use the following context:\n# currentDate\nToday's date is " +
-        day +
-        ".\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.</system-reminder>",
-    },
-  ],
+  content: [{ type: "text", text: "<system-reminder>Today's date is " + day + ".</system-reminder>" }],
 }
 // the device, and the conversation as x-session-id names it; the agent named none
 const userID = () => JSON.stringify({ device_id: DEVICE, account_uuid: "", session_id: _internal.sessionOf("", DEVICE) })
@@ -163,9 +167,9 @@ test("a Start Plan request's system is ZCode's three blocks, the agent's text at
     expect(b.system.length).toBe(3)
     expect(b.system).toEqual(zcodeSystem("zai-api/GLM-5.3", undefined, own))
     // the first two are ZCode's byte for byte; the third ends with the agent's
-    expect(sha(b.system[0].text)).toBe("46dd360a22c87a92")
-    expect(sha(b.system[1].text)).toBe("49bda31511fc9670")
-    expect(b.system[2].text.endsWith(PROMPT.afterEnvironment + "\n\n" + own.join("\n\n"))).toBe(true)
+    expect(sha(b.system[0].text)).toBe("7779642ea44a4696")
+    expect(sha(b.system[1].text)).toBe("8eaf38ce3f1f2f15")
+    expect(b.system[2].text.endsWith(PROMPT.contextManagement + "\n\n" + own.join("\n\n"))).toBe(true)
   }
   // with no system of the agent's, the third block ends where ZCode's does
   got.length = 0
@@ -173,20 +177,57 @@ test("a Start Plan request's system is ZCode's three blocks, the agent's text at
   expect(JSON.parse(r.body).system).toEqual(zcodeSystem("zai-api/GLM-5.3"))
 })
 
+// plugins#348 (XinOrigin, 11-04): zcode.z.ai lets a Start Plan request
+// through only when its system is an array of two or three text blocks,
+// ZCode's first byte for byte and its second as ZCode's begins; a string,
+// no system, the first alone, the first with a block of the caller's, or a
+// fourth block answers 405/3012. Claude Code's billing-header block and
+// Codex's string instructions, the two shapes a magpie agent sends, each
+// go out as the passing row: ZCode's three, the agent's text after
+// ZCode's own sections in the third. On 11-06 both, and Claude Code's
+// thinking, context_management and output_config, got past the check
+// live (1005 for an account with no gift) where ZCode's first block alone
+// got 3012.
+test("an agent's system goes out as the shape zcode.z.ai lets through (plugins#348)", async () => {
+  const claude = [
+    { type: "text", text: "x-anthropic-billing-header: cc_version=2.1.310; cc_entrypoint=cli;" },
+    { type: "text", text: "You are an interactive agent that helps users with software engineering tasks.", cache_control: eph },
+    { type: "text", text: "# CLAUDE.md\nproject rules", cache_control: eph },
+  ]
+  const codex = "You are Codex, a coding agent. You and the user share the same workspace."
+  const extra = { thinking: { type: "adaptive" }, context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] }, output_config: { effort: "high" } }
+  for (const system of [claude, codex, undefined, [{ type: "text", text: PROMPT.cliPrefix }]]) {
+    got.length = 0
+    const r = await send(start("zai"), JSON.stringify({ model: "GLM-5.3-Flash", max_tokens: 8, system, ...extra, messages: [{ role: "user", content: "hi" }] }))
+    const b = JSON.parse(r.body)
+    expect(Array.isArray(b.system)).toBe(true)
+    expect(b.system.length).toBe(3)
+    expect(b.system.every((x) => x.type === "text")).toBe(true)
+    expect(b.system[0].text).toBe(PROMPT.cliPrefix)
+    expect(b.system[1].text).toBe(PROMPT.stableSections.join("\n\n"))
+    expect(b.system[2].text.startsWith("\n\n" + PROMPT.dynamicBehavior)).toBe(true)
+    const own = system === undefined ? [] : typeof system === "string" ? [system] : system.map((x) => x.text)
+    expect(b.system[2].text.endsWith(PROMPT.contextManagement + (own.length ? "\n\n" + own.join("\n\n") : ""))).toBe(true)
+    for (const k of Object.keys(extra)) expect(b[k]).toEqual(extra[k])
+  }
+})
+
 test("the prompt texts are the plugin's, byte for byte", () => {
-  expect(sha(PROMPT.cliPrefix)).toBe("46dd360a22c87a92")
-  expect(PROMPT.cliPrefix).toBe("You are ZCode, an interactive coding agent")
+  expect(sha(PROMPT.cliPrefix)).toBe("7779642ea44a4696")
+  expect(PROMPT.cliPrefix).toBe("You are ZCode, an interactive agent")
   expect(PROMPT.stableSections.length).toBe(2)
-  expect(sha(PROMPT.stableSections[0])).toBe("3f21ff9a88a03a76")
-  expect(PROMPT.stableSections[0].length).toBe(1211)
-  expect(sha(PROMPT.stableSections[1])).toBe("39a1e86c93452c01")
-  expect(PROMPT.stableSections[1].length).toBe(1100)
-  expect(sha(PROMPT.stableSections.join("\n\n"))).toBe("49bda31511fc9670")
-  expect(PROMPT.stableSections.join("\n\n").length).toBe(2313)
-  expect(sha(PROMPT.beforeEnvironment)).toBe("bbdc66b399d297ff")
-  expect(PROMPT.beforeEnvironment.length).toBe(3065)
-  expect(sha(PROMPT.afterEnvironment)).toBe("1732b7f098a925d7")
-  expect(PROMPT.afterEnvironment.length).toBe(1915)
+  expect(sha(PROMPT.stableSections[0])).toBe("aac4ba4cc7b555b3")
+  expect(PROMPT.stableSections[0].length).toBe(1229)
+  expect(sha(PROMPT.stableSections[1])).toBe("86e0396775d5ed0e")
+  expect(PROMPT.stableSections[1].length).toBe(1377)
+  expect(sha(PROMPT.stableSections.join("\n\n"))).toBe("8eaf38ce3f1f2f15")
+  expect(PROMPT.stableSections.join("\n\n").length).toBe(2608)
+  expect(sha(PROMPT.dynamicBehavior)).toBe("7d843753f3adae93")
+  expect(PROMPT.dynamicBehavior.length).toBe(975)
+  expect(sha(PROMPT.sessionGuidance)).toBe("6596a0131800c779")
+  expect(PROMPT.sessionGuidance.length).toBe(163)
+  expect(sha(PROMPT.contextManagement)).toBe("406a0480d88086cd")
+  expect(PROMPT.contextManagement.length).toBe(559)
 })
 
 test("a Start Plan request carries ZCode's headers, and only those", async () => {
@@ -202,8 +243,8 @@ test("a Start Plan request carries ZCode's headers, and only those", async () =>
     "anthropic-version": "2023-06-01",
     "content-type": "application/json",
     "http-referer": "https://zcode.z.ai",
-    "user-agent": "ZCode/3.16.3 ai-sdk/anthropic/3.0.81",
-    "x-zcode-app-version": "3.16.3",
+    "user-agent": "ZCode/3.17.2 ai-sdk/anthropic/3.0.81",
+    "x-zcode-app-version": "3.17.2",
     "x-title": "Z Code@cli",
     "x-release-channel": "production",
     "x-client-language": o.locale,
@@ -284,15 +325,27 @@ test("a Start Plan request's body is dressed as ZCode's", async () => {
     stream: true,
   })
   // the blocks' texts, by the plugin's hashes
-  expect(sha(b.system[0].text)).toBe("46dd360a22c87a92")
-  expect(sha(b.system[1].text)).toBe("49bda31511fc9670")
+  expect(sha(b.system[0].text)).toBe("7779642ea44a4696")
+  expect(sha(b.system[1].text)).toBe("8eaf38ce3f1f2f15")
   const dyn = b.system[2].text
-  expect(dyn.startsWith("\n\n" + PROMPT.beforeEnvironment + "\n\n# Environment\n")).toBe(true)
-  expect(dyn.endsWith("\n\n" + PROMPT.afterEnvironment + "\n\nYou are opencode, an agent.\n\nProject instructions.")).toBe(true)
-  expect(sha(dyn.slice(2, 2 + 3065))).toBe("bbdc66b399d297ff")
+  expect(dyn.startsWith("\n\n" + PROMPT.dynamicBehavior + "\n\n# Environment\n")).toBe(true)
+  expect(dyn.includes("\n\n" + poweredBy("zai-api/GLM-5.3-Flash") + "\n\n" + PROMPT.contextManagement)).toBe(true)
+  expect(dyn.endsWith("\n\n" + PROMPT.contextManagement + "\n\nYou are opencode, an agent.\n\nProject instructions.")).toBe(true)
+  expect(sha(dyn.slice(2, 2 + PROMPT.dynamicBehavior.length))).toBe("7d843753f3adae93")
+  // no slash-skill guidance without a Skill tool in the request
+  expect(dyn.includes(PROMPT.sessionGuidance)).toBe(false)
   expect(b.metadata.user_id).toBe(userID())
   // exactly one cache mark in the turns, and none on the tools
   expect((r.body.match(/cache_control/g) ?? []).length).toBe(4)
+})
+
+test("a Skill tool brings the slash-skill guidance into the third block", async () => {
+  const body = { ...agentBody, tools: [{ name: "Skill", description: "Invoke a skill", input_schema: { type: "object" } }] }
+  const r = await send(start("zai"), JSON.stringify(body))
+  const b = JSON.parse(r.body)
+  const dyn = b.system[2].text
+  expect(dyn.startsWith("\n\n" + PROMPT.dynamicBehavior + "\n\n" + PROMPT.sessionGuidance + "\n\n# Environment\n")).toBe(true)
+  expect(b.system).toEqual(zcodeSystem("zai-api/GLM-5.3-Flash", undefined, ["You are opencode, an agent.", "Project instructions."]).map((x, i) => (i === 2 ? { ...x, text: dyn } : x)))
 })
 
 test("a BigModel sign-in's Start Plan names bigmodel-api; a string turn takes the cache mark", async () => {
@@ -334,17 +387,17 @@ test("a Start Plan request says the agent's folder as magpie tells it, and no fo
   const dir = "C:\\Users\\me\\My Proj 中文 & <x>"
   let r = await send(start("zai"), JSON.stringify(agentBody), { place: { dir: encodeURIComponent(dir), git: "yes" } })
   expect(JSON.parse(r.body).system).toEqual(
-    zcodeSystem("zai-api/GLM-5.3-Flash", ["- Primary working directory: " + dir, "- Is a git repository: yes"], AGENT_OWN),
+    zcodeSystem("zai-api/GLM-5.3-Flash", [" - Primary working directory: " + dir, " - Is a git repository: true"], AGENT_OWN),
   )
   expect(r.headers["x-magpie-work-dir"]).toBeUndefined()
   expect(r.headers["x-magpie-work-git"]).toBeUndefined()
   got.length = 0
   r = await send(start("zai"), JSON.stringify(agentBody), { place: { dir: encodeURIComponent("/Users/me/notes"), git: "no" } })
-  expect(JSON.parse(r.body).system[2].text).toContain("- Primary working directory: /Users/me/notes\n- Is a git repository: no\n- Platform: ")
+  expect(JSON.parse(r.body).system[2].text).toContain(" - Primary working directory: /Users/me/notes\n - Is a git repository: false\n - Platform: ")
   got.length = 0
   // a folder whose repository magpie doesn't know: no git line
   r = await send(start("zai"), JSON.stringify(agentBody), { place: { dir: encodeURIComponent("/srv/x") } })
-  expect(JSON.parse(r.body).system[2].text).toContain("- Primary working directory: /srv/x\n- Platform: ")
+  expect(JSON.parse(r.body).system[2].text).toContain(" - Primary working directory: /srv/x\n - Platform: ")
   got.length = 0
   // nothing told (an older magpie, an agent that says no folder): neither
   // line, and never the plugin's own folder or shell
@@ -353,7 +406,7 @@ test("a Start Plan request says the agent's folder as magpie tells it, and no fo
   expect(JSON.parse(r.body).system).toEqual(zcodeSystem("zai-api/GLM-5.3-Flash", undefined, AGENT_OWN))
   expect(text).not.toContain("Primary working directory")
   expect(text).not.toContain("Is a git repository")
-  expect(text).not.toContain("- Shell:")
+  expect(text).not.toContain(" - Shell:")
   expect(r.body).not.toContain(JSON.stringify(process.cwd()).slice(1, -1))
   expect(r.headers["x-magpie-work-git"]).toBeUndefined()
 })
@@ -410,6 +463,57 @@ test("a team seat's request goes as the agent sent it, ZCode's token or not", as
 const START_RESTRICTED = "ZCode's risk control blocked this account for unusual activity (code 3012); it rests, and the group's other providers are used. If the ZCode app fails on this account too, only ZCode support can lift the block"
 const START_EDGE = "the provider's network firewall blocked requests from this IP; wait a while, or switch to another network or proxy"
 
+// plugins#649: a block page is the address's, so the requests after it are
+// held off zcode.z.ai a while, from every account of the process, and
+// answered with the same 405 and hint; the coding plan, on another host,
+// goes on. A 3012 is the account's and holds nothing.
+test("a block page holds the Start Plan off zcode.z.ai for every account a while, and nothing else (plugins#649)", async () => {
+  const ask = async (auth) => {
+    routeToFake()
+    const hooks = await ZCodeAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const opts = await hooks.auth.loader(async () => auth, { id: "zcode" })
+    const res = await opts.fetch("https://api.z.ai/api/anthropic/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-api-key": "zcode" }, body: agentText })
+    return { status: res.status, text: await res.text(), signIn: res.headers.get("x-magpie-sign-in") }
+  }
+  const messages = () => got.filter((r) => r.path.endsWith("/messages")).length
+  // a 3012 holds nothing: the next request is asked
+  answer = () => Response.json({ code: 3012, msg: "request has been blocked due to unusual activity." }, { status: 405 })
+  await ask(start("zai"))
+  await ask(start("zai"))
+  expect(messages()).toBe(2)
+  got.length = 0
+  answer = () => new Response("<html>Sorry, your request has been blocked due to unusual activity. errors.aliyun.com</html>", { status: 405, headers: { "content-type": "text/html" } })
+  const before = Date.now()
+  let r = await ask(start("zai"))
+  expect(r.status).toBe(405)
+  expect(messages()).toBe(1)
+  expect(_internal.edge.until).toBeGreaterThanOrEqual(before + _internal.EDGE_HOLD)
+  expect(_internal.edge.until).toBeLessThanOrEqual(Date.now() + _internal.EDGE_HOLD)
+  // held: the same account and another one are answered here, with the
+  // same status and magpie's BlockedHint, so the gateway still falls back
+  answer = () => Response.json({ type: "message", content: [] })
+  const other = { type: "oauth", access: jwt, refresh: JSON.stringify({ site: "zai", device: "99999999-2222-4333-8444-555555555555", jwt, plan: "Start Plan" }), expires: 0 }
+  for (const auth of [start("zai"), other]) {
+    r = await ask(auth)
+    expect(r.status).toBe(405)
+    expect(r.signIn).toBe("kept")
+    const e = JSON.parse(r.text).error
+    expect(e.type).toBe("permission_error")
+    expect(e.message).toStartWith("405 Method Not Allowed — " + START_EDGE + " (")
+    expect(e.message).toMatch(/until \d\d:\d\d:\d\d/)
+  }
+  expect(messages()).toBe(1)
+  // a GLM Coding Plan key goes to api.z.ai, held or not
+  r = await ask({ type: "api", key: "one.secret", metadata: { site: "zai" } })
+  expect(r.status).toBe(200)
+  expect(messages()).toBe(2)
+  // once the hold is over, the Start Plan is asked again
+  _internal.edge.until = Date.now() - 1
+  r = await ask(start("zai"))
+  expect(r.status).toBe(200)
+  expect(messages()).toBe(3)
+})
+
 test("the Start Plan's 3012 says ZCode blocked the account, and a block page the network (plugins#348, #425)", async () => {
   const ask = async (auth, url = "https://api.z.ai/api/anthropic/v1/messages") => {
     routeToFake()
@@ -442,6 +546,7 @@ test("the Start Plan's 3012 says ZCode blocked the account, and a block page the
   expect(r.status).toBe(405)
   expect(JSON.parse(r.text)).toEqual({ type: "error", error: { type: "permission_error", message: "405 Method Not Allowed — " + START_EDGE } })
   expect(r.text).not.toMatch(/request has been blocked/)
+  _internal.edge.until = 0
   // any other refusal of the Start Plan goes on as it came
   answer = () => Response.json({ type: "error", error: { type: "overloaded_error", message: "busy" } }, { status: 529 })
   r = await ask(start("zai"))

@@ -11,6 +11,10 @@ subscription and makes its requests. The packages work in OpenCode and in
 
 | Package | Signs in to | Provider id |
 |---|---|---|
+| [agnes](packages/agnes) | Agnes AI international (agnes-ai.com), with Chrome browser sign-in, live text models, plan usage and USD balance | `agnes` |
+| [agnes-code](packages/agnes-code) | Agnes AI's Agnes Code desktop, with the desktop's saved session (Windows) or a pasted access token: live models, daily credit check-in and points balance (unofficial) | `agnes-code` |
+| [astudio](packages/astudio) | iFlytek's AStudio (科大讯飞 Astron Studio desktop), with the desktop's saved credentials or a pasted model token: live model catalog, daily login-points check-in and points balance (unofficial) | `astudio` |
+| [atomcode](packages/atomcode) | AtomGit CodingPlan, with browser OAuth or the local AtomCode CLI's sign-in, signed requests, live models, quota windows and a read-only diagnostics page (unofficial) | `atomcode` |
 | [catpaw](packages/catpaw) | Meituan's 妙手 CatPaw (ai.catpaw.meituan.com), with a browser web sign-in or the desktop client's saved credentials | `catpaw` |
 | [cline](packages/cline) | Cline (cline.bot): usage-billed models, ClinePass's and Cline's free ones, with Cline's device sign-in or an API key | `cline` |
 | [codearts](packages/codearts) | Huawei Cloud CodeArts (码道) coding plans (Trial, personal and enterprise credits), with Huawei Cloud OAuth sign-in (unofficial) | `codearts` |
@@ -25,6 +29,7 @@ subscription and makes its requests. The packages work in OpenCode and in
 | [kimi-work](packages/kimi-work) | Ordinary Kimi desktop Work subscription, through the desktop app's local sign-in; separate from Kimi Code | `kimi-work` |
 | [kiro](packages/kiro) | Kiro (Free, Pro, Pro+, Power), with Kiro's sign-in, kiro-cli's or the IDE's, or an API key | `kiro` |
 | [loomy](packages/loomy) | iFlytek's Loomy (loomyad.xunfei.cn), with SMS sign-in | `loomy` |
+| [mclaw](packages/mclaw) | China Mobile Cloud's MClaw agent (ai.yun.139.com), with a browser sign-in that harvests the ticket and auto-fetches the llm key: live models with token multipliers, aitokens pool usage, auto renewal (unofficial) | `mclaw` |
 | [minimax](packages/minimax) | MiniMax Code (China): account credits and M Plan, with MiniMax Code's device sign-in | `minimax-code` |
 | [minimax](packages/minimax) | MiniMax Code (international): account credits and M Plan, with MiniMax Code's device sign-in | `minimax-code-global` |
 | [mimo](packages/mimo) | Xiaomi MiMo, with a Xiaomi account | `mimo-app` |
@@ -34,6 +39,8 @@ subscription and makes its requests. The packages work in OpenCode and in
 | [qoder](packages/qoder) | Qoder CN subscription (qoder.cn), with Qoder CN's device sign-in | `qoder-cn` |
 | [raccoon](packages/raccoon) | SenseTime Raccoon (商汤小浣熊, xiaohuanxiong.com): account credits and daily check-in, with browser sign-in or Raccoon desktop's sign-in | `raccoon` |
 | [river](packages/river) | River (river.ai) pay-as-you-go inference, with your API key: per-account models, documented reasoning efforts and live prices | `river` |
+| [sap-aicore](packages/sap-aicore) | SAP AI Core deployments for account-scoped GPT Responses and Claude Messages models | `sap-aicore` |
+| [sensenova](packages/sensenova) | SenseNova (商汤日日新) Token Plan: browser or password sign-in gives the credit pools, windows and grants, and the plan's models — the browser sign-in reuses or creates a Token Plan API key for you | `sensenova-token-plan` |
 | [trae](packages/trae) | Trae CN (trae.cn) and Trae international (trae.ai), free tier included, with Trae's browser sign-in (experimental) | `trae-cn`, `trae-global` |
 | [workbuddy](packages/workbuddy) | WorkBuddy (China build, CodeBuddy plan) | `workbuddy` |
 | [workbuddy](packages/workbuddy) | WorkBuddy (international build) | `workbuddy-ai` |
@@ -51,10 +58,11 @@ These packages aren't OpenCode plugins. magpie runs them in its gateway, on the 
 | [model-map](packages/model-map) | New API's 模型重定向 (`model_mapping`): send a model under another name, by name or `/pattern/`; replies name the model asked for |
 | [system-prompt](packages/system-prompt) | Your own system prompt on every request, or on some agents' or models', in each API's own place |
 | [word-guard](packages/word-guard) | New API's 敏感词过滤: turn away or mask words and patterns in what users send, and in replies |
-| [think-tags](packages/think-tags) | Take `<think>…</think>` out of a reply's text, or put a Chat reply's `reasoning_content` into it (`thinking_to_content`) |
+| [think-tags](packages/think-tags) | Take a leading `<think>`, `<thinking>` or `<thought>` block out of a reply's text, or put a Chat reply's `reasoning_content` into it (`thinking_to_content`) |
 | [antigravity-cloak](packages/antigravity-cloak) | Claude Code and Claude Desktop on Antigravity: break the words Antigravity turns their system prompt away for, in what Antigravity alone is sent |
 | [codex-history](packages/codex-history) | Opt-in Responses history compatibility after switching providers: remove historical ciphertext and optional item IDs while preserving readable content and tool-call pairing |
 | [history-trim](packages/history-trim) | Send a request's history smaller: fold a run of blank lines, drop a system prompt written twice and a message repeated right after itself, and cut a past tool result longer than `maxToolLength` at a word boundary |
+| [agentcompass](packages/agentcompass) | [AgentCompass](https://github.com/akiiwa-games/AgentCompass) multi-dimensional task profiling, capability floor, Model DNA (`divergence`, `global_rigor`, `module_precision`), subscription quota opportunity-cost, and session-affinity routing (`magpie.middleware` + opt-in `/v1/systemone`) |
 
 ```sh
 magpie plugin add @magpie-community/middleware-<name>
@@ -108,6 +116,56 @@ A tools package is a folder under `packages/<name>/` with:
 - **`index.mjs`**: exports one async plugin function that returns a `tool` hook, `{tool: {<name>: {description, args, execute(args)}}}` ([the reference](https://usemagpie.ai/docs/plugins#tools)). `args` is JSON Schema, and magpie passes the arguments on as they came, so `execute` checks them itself. A string it returns is sent as text, anything else as its JSON. Every function the module exports is taken as a plugin, so helpers go in another file.
 - a test of each tool's `execute`. `bun scripts/check.mjs` loads the plugin and checks each tool's name, description and `args`.
 
+## Web search APIs
+
+A tools package can also give magpie a web search API. It is listed in Settings › Models › Web search under its own name, after Tavily, Brave and the rest, and is added, keyed, switched off and ordered like them. magpie keeps the keys (several are tried in turn; a refused one rests), masks the query, and logs the call. magpie's own `search` hook; OpenCode ignores it.
+
+| Package | Search APIs |
+|---|---|
+| [magpie-websearch](https://github.com/guotree/magpie-websearch) | AnySearch, Bocha, Jina, Kagi, Keenable, Linkup, Metaso, Moonshot, Moonshot CN, Ollama, Parallel, Perplexity, Querit, SerpApi, Serper, StepFun, TinyFish, Z.ai and Zhipu; published as `@guotree/magpie-websearch` and maintained in its own repository |
+| [magpie-search-mix](https://github.com/mdwsk88/magpie-search-mix) | Search Mix: asks two (or more) of Tavily, Brave, Exa, Firecrawl, You.com, DeepSeek, Doubao Search, Yuanbao Search and SearXNG at once, the ones you name in its key field, and gives their pages in turn, deduplicated; published as `magpie-search-mix` and maintained in its own repository |
+
+Install magpie-websearch:
+
+```sh
+magpie plugin add @guotree/magpie-websearch
+```
+
+Install magpie-search-mix:
+
+```sh
+magpie plugin add magpie-search-mix
+```
+
+### Writing a web search plugin
+
+The following template shows how to implement the `search` hook:
+
+```js
+// index.mjs of @magpie-community/tools-<name>
+export const MySearch = async () => ({
+  search: {
+    myvendor: {                    // [a-z0-9-], at most 32; listed as `<name>:myvendor`
+      name: "My vendor",
+      keysURL: "https://example.com/keys",   // optional "Get a key" link
+      keyOptional: false,                    // true: it answers with no key
+      url: false,                            // true: the user gives its address, as for SearXNG
+      async execute({ query, count, key, url }, ctx) {
+        const r = await fetch(`https://example.com/search?q=${encodeURIComponent(query)}&n=${count}`, {
+          headers: { authorization: `Bearer ${key}` },
+          signal: ctx.abort,
+        })
+        // a throw with a numeric `status` is the vendor refusing the key (401, 402, 403, 429 rest it)
+        if (!r.ok) throw Object.assign(new Error(await r.text()), { status: r.status })
+        return (await r.json()).results.map((x) => ({ title: x.title, url: x.url, text: x.snippet }))
+      },
+    },
+  },
+})
+```
+
+`execute` returns `[{title, url, text?, age?}]` or `{results: [...]}`; pages with no url are dropped, and magpie strips tags and cuts the text. Any other throw is a failure and the next search API is asked. It has a quarter of a search's limit, and `ctx.abort` fires then. magpie reads the list a plugin gives from the last time the plugin loaded, so a plugin just added is listed once it has loaded. [The reference](https://usemagpie.ai/docs/plugins) does not have this yet.
+
 ## Pages
 
 These add a page to magpie's window, in the app and in `magpie web`, under Plugins in the sidebar.
@@ -117,9 +175,12 @@ These add a page to magpie's window, in the app and in `magpie web`, under Plugi
 | [usage](packages/usage) | Usage glance: calls, errors, tokens and cost for today, 7 or 30 days, and the models behind them | `usage:summary` |
 | [powercontext](packages/powercontext) | Connection settings for an independently deployed PowerContext service | None |
 | [nowledge-mem](packages/nowledge-mem) | Connection settings, recall and capture switches, a real connection test, and the scope of what is sent | None |
-| [agent-office](packages/agent-office) | What are my agents doing: live sessions as workers in a voxel office (3D/2D) or a list, with status, current step and resume commands | no `magpie.read`; its host part reads the local session files of Claude Code, Codex, dsh, Gemini CLI, Qwen Code, Pi, omp, Qoder, WorkBuddy and CodeBuddy, including prompts, replies and tool commands (`text:false` keeps statuses and tool names only) |
+| [agent-office](packages/agent-office) | What are my agents doing: a real WebGL 3D office with six scenes, an isometric/2D office, grouped workbench, Today usage and recent conversations | no `magpie.read`; its host part reads local session files of Claude Code, Codex, Copilot CLI, Kimi Code, dsh, Gemini CLI, Qwen Code, Pi, omp, Qoder, WorkBuddy, CodeBuddy and Grok Build, including prompts, replies and tool commands (`text:false` keeps statuses and tool names only) |
+| [page-usage-tree](packages/page-usage-tree) | Account usage: usage as provider -> account -> model, each level expandable, with per-account calls, errors and cost; adds the account layer Usage glance's `usage:summary` does not contain | none (its local service calls Magpie's local usage API) |
 | [fingerprint](packages/fingerprint) | Numeric response fingerprints to investigate suspected model substitution across providers, with shared challenges, candidate rankings, local evidence and JSON export | none (its local service calls magpie’s gateway; sampling uses provider quota) |
 | [chat](packages/chat) | Chat with magpie's models, your MCP servers, instructions and skills, by Magic_zero ([Magiczerowxy](https://github.com/Magiczerowxy)). Has a host part: a local service the page goes to | none (its service calls magpie's gateway) |
+| [window-warmup](packages/window-warmup) | Window warmup: send one fixed short message ("hi", max_tokens 16) to a provider, account and model you pick, right after its quota window resets, daily at set times or every few hours, so the next subscription window opens early, by [YangHonghang](https://github.com/YangHonghang). Has a host part: a local service on 127.0.0.1 the page goes to | none; its service calls magpie's gateway and reads magpie's providers.json (keys only as sha256 fingerprints, plus key names and account models) and model cache. Each send uses the chosen account's quota |
+| [agent-console](packages/agent-console) | Drive the Agent CLIs on this computer (Claude Code, Codex, Cursor, Copilot, OpenCode, Pi, Devin, dsh) with a timeline, Git changes, files and a terminal, by [qingnian108](https://github.com/qingnian108). Has a host part: a gate and a daemon on 127.0.0.1, started when the page opens | none (its daemon runs the Agent CLIs you pick, in the projects you open) |
 
 ```sh
 magpie plugin add @magpie-community/page-<name>
@@ -140,12 +201,19 @@ Like middleware, these run on the requests agents send, but in magpie's Bun host
 |---|---|
 | [powercontext](packages/powercontext) | [PowerContext](https://github.com/oceanbase/powercontext) recall and opt-in completed-conversation capture; no client MCP or skill required |
 | [nowledge-mem](packages/nowledge-mem) | [Nowledge Mem](https://mem.nowledge.co) recall, Context Bundle or Working Memory, per-harness provenance and opt-in conversation import as Mem Threads, automatic for every harness behind Magpie |
+| [aelios](packages/aelios) | [Aelios](https://github.com/Aelios-project/Aelios) recall before each turn from your own Aelios on Cloudflare, and opt-in recording of each turn so Aelios can remember it |
+| [respire-memory](packages/respire-memory) | [Respire](https://github.com/risense-ai/respire-magpie): per-turn recall and complete policy reads, automatic process diaries, and grounded experience archival with readback; storage runs after reply completion |
+| [OpenViking](https://github.com/volcengine/OpenViking/tree/main/examples/magpie-memory-plugin) | OpenViking context recall and opt-in completed-conversation capture using existing OpenViking configuration; published as `@openviking/magpie-plugin` and maintained in the OpenViking repository |
+| [@vshulcz/magpie-deja](https://github.com/vshulcz/deja-vu/tree/main/extensions/magpie) | [deja-vu](https://github.com/vshulcz/deja-vu) local cross-agent session memory: recalls project-scoped (`ctx.cwd`) history from the transcripts Claude Code, Codex, Hermes, Gemini CLI, OpenCode, Cursor and DSH write on disk, scrubs secret patterns, and attaches the recalled excerpt to the request sent to your model provider; when recalled history helped, the model is asked to end its reply with a one-line `déjà vu: … — reusing it.` note |
+| [notify](packages/notify) | A push to ntfy, Bark, Gotify, Server酱, Feishu, DingTalk, WeCom, Telegram or a webhook when an agent's turn is done or fails, after it ran `minMinutes` or longer |
 
 Use the same plugin management commands as middleware:
 
 ```sh
 magpie plugin add @magpie-community/gateway-powercontext
 magpie plugin add @magpie-community/gateway-nowledge-mem
+magpie plugin add @magpie-community/gateway-aelios
+magpie plugin add @magpie-community/gateway-notify
 ```
 
 Installed plugins use **Plugins › Installed › Options** and the normal on/off
@@ -192,10 +260,12 @@ it off puts the config back.
 | Package | Agent |
 |---|---|
 | [aider](packages/aider) | [Aider](https://aider.chat): `~/.aider.conf.yml`, through litellm's `openai/` prefix |
+| [reasonix-desktop](packages/reasonix-desktop) | [Reasonix 1.x](https://github.com/esengine/DeepSeek-Reasonix/tree/main-v2) Desktop and CLI: reversible global TOML/dotenv bridge; restart Reasonix after choosing a model. Separate from the built-in Studio 2.x adapter |
 | [bub](packages/bub) | [Bub](https://bub.build): `~/.bub/config.yml`, as the `magpie:` provider (needs Bub 0.5.1 or later) |
 | [kilo](packages/kilo) | [Kilo Code](https://kilo.ai): `~/.config/kilo/kilo.jsonc`, through an OpenAI-compatible provider |
+| [junie](packages/junie) | [Junie CLI](https://junie.jetbrains.com/): an explicit `/v1/models` seed for its full picker and Magpie's selected model as the launch default; no LiteLLM |
 | [kimi-desktop](packages/kimi-desktop) | Ordinary [Kimi desktop](https://www.kimi.com/) Work, through its authenticated local runtime; not Kimi Code CLI |
-| [pig](packages/pig) | [PiG](https://github.com/MichaelKinsy/PiG): injects Magpie's endpoint and model catalog into `~/.pig/agent/models.json`; choose the model in PiG, startup settings stay unchanged |
+| [pig](packages/pig) | [PiG](https://github.com/MichaelKinsy/PiG): Magpie's endpoint and model catalog in `~/.pig/agent/models.json`, and the model PiG starts on (`defaultProvider`/`defaultModel` in `settings.json`) picked on the Agents page |
 | [type4me](packages/type4me) | [Type4Me](https://github.com/joewongjc/type4me), macOS voice input: `~/Library/Application Support/Type4Me/magpie-agent.json`, for its LLM post-processing |
 | [opencodereview](packages/opencodereview) | [Open Code Review](https://github.com/alibaba/open-code-review) (`ocr`): `~/.opencodereview/config.json` as a custom Anthropic provider, so `ocr review` / `ocr scan` run on magpie's models |
 
@@ -205,9 +275,17 @@ magpie plugin add @magpie-community/agent-<name>
 
 An agent package is a folder under `packages/<name>/` with:
 
-- **`package.json`**: name `@magpie-community/agent-<name>`, `"magpie": {"agent": "./<name>.agent.js"}`, no `main`.
+- **`package.json`**: name `@magpie-community/agent-<name>`, `"magpie": {"agent": "./<name>.agent.js"}`, and no `main` unless the agent needs a runtime (below).
 - **`<name>.agent.js`**: exports `agent` (where the agent keeps its model) and, if it needs more than the model, `connect` (the other keys to write) ([the reference](https://usemagpie.ai/docs/plugins#agents)). It runs in magpie on moejs, so it is one file and imports nothing.
 - a test of what `connect` returns.
+
+An agent that needs more than moejs gives it (a timer, a file watched, a
+value carried into the app's own config while it runs) keeps its
+`<name>.agent.js` as above and adds a Bun module as the package's `main`,
+run in the plugin host as a provider plugin's is (kimi-desktop and
+reasonix-desktop do). It is still an agent: magpie lists a package that
+declares `magpie.agent` under Agents, on GitHub too, `main` or not, and its
+Installed row wears Provider only when that module serves a provider.
 
 ## Skills
 
@@ -333,12 +411,31 @@ MIT
 `registry.json` is the list magpie's Plugins tab shows: the packages
 here. An entry that signs in to nothing has a `"kind"` and no `providers`:
 `"middleware"` for gateway middleware and routing strategies, `"tools"`,
-`"page"` or `"agent"`. magpie
+`"page"` or `"agent"`. A package that declares `magpie.agent` is
+`"agent"`, with a `main` or without. magpie
 fetches it every few hours and keeps a copy built into the app for when
 it can't. To list a plugin, add an entry with its npm `package`, a
 `name`, `providers` (the provider ids it signs in to), an `icon` (one
 magpie has, or none) and a `summary` in English and Chinese (`{"en": …, "zh": …}`), and open a pull
 request.
+
+### One channel already listed
+
+Duplicates are judged by channel, not by the shape of the package. A
+channel is the vendor service a provider id signs in to, so `astudio` and
+`hub-astudio` are one channel. A channel counts as listed when any entry
+has it, including an aggregate package that names it in its `providers`
+array.
+
+A new standalone package for a listed channel says how it differs from
+the entry already there: how it signs in, which endpoint it calls, what it
+supports, and what it can do that the existing entry can't. That goes in
+three places: the pull request, the package's README and its registry
+`summary` (en and zh), so a user can tell which one to install. A package
+that can't name a difference is not merged. Two entries for one channel
+that are both kept say in their READMEs and summaries what they share,
+such as one account's credit pool
+([#614](https://github.com/magpie-community/plugins/issues/614)).
 
 ## Publishing
 
